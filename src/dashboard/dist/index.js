@@ -2366,8 +2366,8 @@
     if (!count) return null;
     return h("span", { className: "ht-approvals-slot", ref: ref },
       h(HostLink, {
-        to: "/teams", rootRef: ref, className: "ht-approvals-badge",
-        title: count + " card(s) blocked on your decision or stuck — open Teams",
+        to: "/synergia", rootRef: ref, className: "ht-approvals-badge",
+        title: count + " card(s) blocked on your decision or stuck — open Synergia",
       },
         h("span", { className: "ht-approvals-dot" }),
         String(count) + " waiting"
@@ -3953,7 +3953,7 @@
       h("section", { className: "ht-hero" },
         h("div", null,
           h("div", { className: "ht-kicker" }, tx(t, "hero.kicker", "Managed agent teams")),
-          h("h1", null, tx(t, "hero.title", "Teams")),
+          h("h1", null, tx(t, "hero.title", "Synergia")),
           h("p", null, tx(t, "hero.subtitle",
             "Rosters, boards and folders in one record. Everything here runs the " +
             "same code the hermes team CLI runs — no second implementation."))
