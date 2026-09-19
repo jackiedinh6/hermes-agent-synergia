@@ -1,0 +1,15 @@
+{
+  "name": "hermes-agent-synergia",
+  "label": "Teams",
+  "description": "Managed agent teams — roster, live task counts, drift, profile catalog and template pickers, all backed by the hermes team CLI's own modules",
+  "icon": "Users",
+  "version": "0.6.0",
+  "tab": {
+    "path": "/teams",
+    "position": "after:skills"
+  },
+  "slots": ["header-right"],
+  "entry": "dist/index.js",
+  "css": "dist/style.css",
+  "api": "plugin_api.py"
+}

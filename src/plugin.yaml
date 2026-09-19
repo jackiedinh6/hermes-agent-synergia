@@ -1,0 +1,34 @@
+name: hermes-agent-synergia
+version: 1.2.0
+manifest_version: 2
+api_version: 1
+description: >
+  Team abstraction over Hermes profiles, Kanban boards and work directories.
+  Groups profiles with roles, binds them to one board and one directory,
+  reconciles the binding, and keeps team agents inside it.
+author: community
+kind: standalone
+license: MIT
+homepage: https://github.com/<you>/hermes-agent-synergia
+tags: [kanban, profiles, orchestration, teams]
+provides_tools: [team_whoami, team_list, team_show, team_status, team_catalog,
+                 team_create_task, team_assign, team_handoff, team_sync,
+                 team_attach_path]
+provides_hooks: [pre_tool_call, kanban_task_claimed, kanban_task_blocked,
+                 on_kanban_dispatch_tick]
+python_dependencies: []            # stdlib + PyYAML (already a Hermes dependency)
+config_schema:
+  registry_dir:   {type: str,  default: "",       description: "Override the host-global registry directory."}
+  tenant_prefix:  {type: str,  default: "",       description: "Prefix for stamped tenant labels, e.g. 'team:'."}
+  default_policy: {type: str,  default: "advise", description: "off | advise | enforce for new teams."}
+  cache_ttl_ms:   {type: int,  default: 1000,     description: "Floor between registry stat() checks on the hot path."}
+  strict_startup: {type: bool, default: false,    description: "Refuse to load when the registry is unparseable (default: degrade)."}
+  catalog_paths:  {type: list, default: [],
+                                                 description: "Extra read-only pack roots, after the plugin's own store. Each must contain packs.json."}
+  role_hints:     {type: dict, default: {},      description: "category or name-glob -> role, pre-filling the picker. Empty = use the built-in map."}
+  default_profile_naming: {type: str, default: "{team}-{short}",
+                                                 description: "Naming template for instantiated profiles. Overridable per team."}
+  dashboard_writes: {type: bool, default: true,  description: "Set false to restore read-only dashboard behaviour."}
+  approvals_notify: {type: str, default: "home", description: "home | off — push cards blocked on a human decision, and cards the dispatcher gave up on, to every configured gateway home channel."}
+  worker_exit_guard: {type: str, default: "wrapper",
+                                                 description: "wrapper | off — wrap dispatcher workers through $HERMES_BIN so a worker that never reached the model exits non-zero instead of being booked as a protocol violation."}
