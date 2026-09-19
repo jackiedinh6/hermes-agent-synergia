@@ -625,17 +625,20 @@ def task_comments(board: str, task_ids, *, limit: int = _COMMENTS_MAX) -> dict:
 
 
 # The status timeline the chat thread draws: every board event that moves a
-# card between lanes, and nothing else. ``commented`` is excluded on purpose —
-# comments already ship through :func:`task_comments`, and keeping both would
-# render every message twice.
+# card between lanes, plus ``attached`` — a deliverable landing is part of the
+# story the operator reads, and it is where the thread hangs the file's chip.
+# ``commented`` is excluded on purpose — comments already ship through
+# :func:`task_comments`, and keeping both would render every message twice.
+# ``attachment_removed`` stays out: the chip simply stops being drawn.
 _EVENT_KINDS = ("created", "dependency_wait", "scheduled", "promoted",
                 "promoted_manual", "claimed", "reclaimed", "blocked",
                 "unblocked", "review_requested", "review_reopened",
-                "changes_requested", "completed", "archived")
+                "changes_requested", "attached", "completed", "archived")
 # The thread polls at 1s, and a ``created`` / ``completed`` payload carries the
 # card's body, result, skills and metadata. Only the keys that name a lane or
 # explain a transition travel, each truncated.
-_EVENT_KEYS = ("status", "reason", "parent", "assignee", "actor", "kind", "outcome")
+_EVENT_KEYS = ("status", "reason", "parent", "assignee", "actor", "kind",
+               "outcome", "filename")
 _EVENT_TEXT_MAX = 200
 _EVENTS_MAX = 100
 

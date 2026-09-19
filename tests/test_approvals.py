@@ -280,6 +280,42 @@ def test_binary_artifact_is_described_not_decoded(alpha, tmp_path):
     assert "not previewable" in out["note"]
 
 
+def test_task_attachments_lists_each_cards_files(alpha, tmp_path):
+    """The thread's bulk read: the same view the approval row carries, keyed by
+    card, so a deliverable is readable where the work is read."""
+    other = tmp_path / "notes.txt"
+    other.write_text("plain", encoding="utf-8")
+    plain = _card("alpha", tenant="alpha", title="second card",
+                  attachments=[("notes.txt", other, "text/plain")])
+    t = storage.load().teams["alpha"]
+    out = approvals.task_attachments(t, [alpha["waiting"], plain, alpha["open"]])
+    assert [a["filename"] for a in out[alpha["waiting"]]] == ["design.md"]
+    assert out[alpha["waiting"]][0]["previewable"] is True
+    assert [a["filename"] for a in out[plain]] == ["notes.txt"]
+    assert out[alpha["open"]] == []
+
+
+def test_task_attachments_skips_another_tenants_card(alpha, tmp_path):
+    """The ids arrive from a URL, so the tenant is re-checked here — a foreign
+    card is absent, not empty, and never leaks a filename."""
+    secret = tmp_path / "secret.md"
+    secret.write_text("theirs", encoding="utf-8")
+    foreign = _card("alpha", tenant="foreign", title="not ours",
+                    attachments=[("secret.md", secret, "text/markdown")])
+    t = storage.load().teams["alpha"]
+    out = approvals.task_attachments(t, [alpha["waiting"], foreign])
+    assert foreign not in out
+    assert list(out) == [alpha["waiting"]]
+
+
+def test_task_attachments_without_a_board_db_is_empty_and_creates_nothing():
+    from hermes_cli import kanban_db
+    _team("gamma", "gamma", tenant="gamma")
+    t = storage.load().teams["gamma"]
+    assert approvals.task_attachments(t, ["t_nope"]) == {}
+    assert not kanban_db.kanban_db_path("gamma").exists()
+
+
 # ── CLI ──────────────────────────────────────────────────────────────────────
 
 def test_cli_approvals_lists_both_lanes_and_filters_by_kind(alpha, parser,

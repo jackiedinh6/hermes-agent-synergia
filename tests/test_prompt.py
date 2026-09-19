@@ -266,3 +266,14 @@ def test_render_accepts_a_plain_mapping_team():
 def test_render_returns_str_within_cap_by_default():
     out = prompt.render(team(), "qa")
     assert isinstance(out, str) and out and len(out) <= prompt.MAX_CHARS
+
+
+def test_attachments_block_says_when_to_attach_and_fits_its_cap():
+    """The human decides from the card and reads only what is attached to it,
+    so the block must name the moment, not just the three tools — and must not
+    be the thing the cap truncates."""
+    out = prompt.render_attachments()
+    assert out == prompt._ATTACHMENTS_BLOCK
+    assert len(out) <= prompt.ATTACHMENTS_MAX_CHARS
+    assert "team_attach_path" in out
+    assert "BEFORE you block with `needs_input` or request review" in out

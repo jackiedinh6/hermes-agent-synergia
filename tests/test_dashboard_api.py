@@ -1579,6 +1579,29 @@ def test_task_tree_carries_events_only_when_asked(client, steerable):
     assert set(rows[0]) == {"id", "kind", "created_at", "payload"}
 
 
+def test_task_tree_carries_attachments_only_when_asked(client, steerable, tmp_path):
+    """A card's deliverable is readable where the work is read, but a status
+    poll must not pay a second board pass for it. The view is the approval
+    row's, ``previewable`` included, so the thread and the inbox draw one chip."""
+    from hermes_cli import kanban_db, kanban_db_connect
+    board = client.get(f"{P}/teams/px/tasks/{steerable}").json()["data"]["board"]
+    art = tmp_path / "DESIGN.md"
+    art.write_text("# Design\n", encoding="utf-8")
+    with kanban_db_connect.connect_closing(
+            db_path=kanban_db.kanban_db_path(board)) as conn:
+        kanban_db.add_attachment(
+            conn, steerable, filename="DESIGN.md", stored_path=str(art),
+            content_type="text/markdown", size=art.stat().st_size)
+    plain = client.get(f"{P}/teams/px/tasks/{steerable}").json()["data"]
+    assert "attachments" not in plain["tasks"][0]
+    row = client.get(
+        f"{P}/teams/px/tasks/{steerable}?attachments=true").json()["data"]["tasks"][0]
+    assert [a["filename"] for a in row["attachments"]] == ["DESIGN.md"]
+    assert row["attachments"][0]["previewable"] is True
+    # Each flag stands alone: asking for files buys neither of the other passes.
+    assert "comments" not in row and "events" not in row
+
+
 def test_task_tree_events_and_comments_are_independent(client, steerable):
     client.post(f"{P}/teams/px/tasks/{steerable}/note", json={"text": "go wide"})
     row = client.get(

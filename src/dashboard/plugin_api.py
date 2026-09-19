@@ -833,19 +833,27 @@ def get_team_task(request: Request, slug: str, task_id: str):
     ``?events=true`` adds each card's status transitions (``created``,
     ``claimed``, ``blocked``, ``completed``, …), the same way and for the same
     reason: the thread draws one entry per transition at the transition's own
-    time, so a card never moves once it is on screen."""
+    time, so a card never moves once it is on screen.
+
+    ``?attachments=true`` adds each card's files, so a deliverable is readable
+    in the thread instead of only in the approval inbox. Same opt-in, same
+    extra pass; the views come from ``approvals`` so the chip the thread draws
+    is the chip the approval card draws."""
     resolve = _mod("resolve")
+    approvals = _mod("approvals")
     t, err, _reg, _storage = _team_or_404(slug)
     if err is not None:
         return err
     want_comments = _truthy(request.query_params.get("comments"))
     want_events = _truthy(request.query_params.get("events"))
+    want_files = _truthy(request.query_params.get("attachments"))
     for rid, group in resolve.task_forest(t.board, t.tenant or t.slug).items():
         if any(x.id == task_id for x in group["tasks"]):
             ids = [x.id for x in group["tasks"]]
             comments = (resolve.task_comments(t.board, ids)
                         if want_comments else {})
             events = resolve.task_events(t.board, ids) if want_events else {}
+            files = approvals.task_attachments(t, ids) if want_files else {}
             rows = []
             for x in group["tasks"]:
                 row = dict(_task_view(x),
@@ -855,6 +863,8 @@ def get_team_task(request: Request, slug: str, task_id: str):
                     row["comments"] = comments.get(x.id, [])
                 if want_events:
                     row["events"] = events.get(x.id, [])
+                if want_files:
+                    row["attachments"] = files.get(x.id, [])
                 rows.append(row)
             return _ok({"team": t.slug, "board": t.board, "root_id": rid,
                         "tasks": rows})

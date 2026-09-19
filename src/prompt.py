@@ -234,7 +234,7 @@ def render(team: Any, profile: Any, max_chars: int = MAX_CHARS) -> str:
 
 # Registered as a second system-prompt section, so the guidance ships with the
 # tool instead of being patched into the substrate's own KANBAN_GUIDANCE.
-ATTACHMENTS_MAX_CHARS = 600
+ATTACHMENTS_MAX_CHARS = 800
 
 _ATTACHMENTS_BLOCK = (
     "## Attachments (team)\n"
@@ -245,7 +245,10 @@ _ATTACHMENTS_BLOCK = (
     "- `kanban_attach_url` — only for a link you were given.\n"
     "Never hand-encode base64, and never publish an internal file somewhere "
     "fetchable just to get a URL. 25 MB cap; `kanban_attachments` lists a card's "
-    "files. Workers may attach only to their own card."
+    "files. Workers may attach only to their own card.\n"
+    "Attach the deliverable BEFORE you block with `needs_input` or request "
+    "review: the human decides from the card and reads only what is attached "
+    "to it. A path in the reason is not a deliverable."
 )
 
 

@@ -395,6 +395,22 @@ def test_task_events_keep_the_newest_within_the_cap(world):
     assert [e["kind"] for e in rows] == ["blocked", "unblocked"]
 
 
+def test_task_events_carry_the_attach_moment_and_its_filename(world, tmp_path):
+    """A deliverable landing is part of the thread's story, and the filename is
+    how the entry finds the file in the card's attachment list."""
+    from hermes_cli import kanban_db as kb
+    art = tmp_path / "DESIGN.md"
+    art.write_text("# Design\n", encoding="utf-8")
+    tid = _carded("proj-board", "with a file")
+    with resolve._kanban_conn().connect_closing(board="proj-board") as conn:
+        kb.add_attachment(conn, tid, filename="DESIGN.md", stored_path=str(art),
+                          content_type="text/markdown", size=art.stat().st_size)
+    rows = resolve.task_events("proj-board", [tid])[tid]
+    attached = [e for e in rows if e["kind"] == "attached"]
+    assert len(attached) == 1
+    assert attached[0]["payload"]["filename"] == "DESIGN.md"
+
+
 def test_task_events_missing_board_is_empty_and_creates_nothing(hermes_root):
     from hermes_cli import kanban_db as kb
     assert resolve.task_events("ghost-board", ["t_1"]) == {}

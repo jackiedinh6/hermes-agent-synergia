@@ -317,6 +317,42 @@ def detail(t, task_id: str) -> dict:
     return row
 
 
+def task_attachments(t, task_ids) -> dict:
+    """``{task_id: [attachment view, ...]}`` for the cards in *task_ids*.
+
+    The chat thread's bulk form of the list :func:`detail` returns for one
+    card, so a deliverable is readable where the work is read instead of only
+    where it is approved. Views are :func:`_attachment_view` — the same shape
+    and the same ``previewable`` predicate the approval rows carry, so the UI
+    has one artifact chip, not two.
+
+    Tolerant like :func:`resolve.task_comments`: a board with no DB yet, or one
+    that cannot be read, is ``{}`` and is never minted. Each card's tenant is
+    re-checked here even though the caller filtered by tenant — the ids arrive
+    from a URL, and the attachment route makes the same check for the same
+    reason."""
+    from hermes_cli import kanban_db
+    ids = [x for x in dict.fromkeys(task_ids or ()) if x]
+    if not ids:
+        return {}
+    ctx = _conn_ctx(t)
+    if ctx is None:
+        return {}
+    tenant = tenant_of(t)
+    out: dict = {}
+    try:
+        with ctx as conn:
+            for tid in ids:
+                task = kanban_db.get_task(conn, tid)
+                if task is None or (task.tenant or "") != tenant:
+                    continue
+                out[tid] = [_attachment_view(a)
+                            for a in kanban_db.list_attachments(conn, tid)]
+    except Exception:  # noqa: BLE001 — an unreadable board reads as no files
+        return {}
+    return out
+
+
 def _is_text(filename, content_type) -> bool:
     ctype = (content_type or "").split(";")[0].strip().lower()
     if ctype.startswith("text/"):

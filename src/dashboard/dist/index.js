@@ -1614,8 +1614,8 @@
     promoted: "ready", promoted_manual: "ready", claimed: "started",
     reclaimed: "restarted", blocked: "blocked", unblocked: "released",
     review_requested: "in review", review_reopened: "review reopened",
-    changes_requested: "changes requested", completed: "done",
-    archived: "archived",
+    changes_requested: "changes requested", attached: "attached",
+    completed: "done", archived: "archived",
   };
   const EVENT_TONES = {
     blocked: "warn", changes_requested: "warn",
@@ -1714,6 +1714,8 @@
   }
 
   function eventDetail(kind, payload, task) {
+    // `attached` says its filename on the chip below the row, not twice.
+    if (kind === "attached") return null;
     if (kind === "dependency_wait") return payload.parent ? "parent " + payload.parent : null;
     if (kind === "created") return payload.status || null;
     if (kind === "completed") {
@@ -1725,7 +1727,8 @@
   function ChatThread(props) {
     const base = "/teams/" + encodeURIComponent(props.slug) + "/tasks/";
     const path = props.rootId
-      ? base + encodeURIComponent(props.rootId) + "?comments=true&events=true" : null;
+      ? base + encodeURIComponent(props.rootId) +
+        "?comments=true&events=true&attachments=true" : null;
     // Cadence follows the work, not the clock: 1s only while a card is running
     // or parked, which is the only time the tree changes between ticks.
     const [live, setLive] = hooks.useState(true);
@@ -1734,6 +1737,9 @@
     // while the card runs" — the running log needs no click, and a collapse
     // the operator made is never undone by the next poll.
     const [logOpen, setLogOpen] = hooks.useState({});
+    // Artifacts open on a click and stay open — keyed by attachment id, which
+    // is board-wide, so two cards' files never collide.
+    const [artOpen, setArtOpen] = hooks.useState({});
     const scrollRef = hooks.useRef(null);
     const follow = hooks.useRef(true);
 
@@ -1800,6 +1806,44 @@
       });
     }
 
+    // The `attached` payload carries no attachment id, so the file is matched
+    // by name: kanban_db renames a duplicate before it writes the row, so a
+    // filename is unique inside one card.
+    function attachmentOf(task, filename) {
+      const list = task.attachments || [];
+      for (let i = 0; i < list.length; i++) {
+        if (list[i].filename === filename) return list[i];
+      }
+      return null;
+    }
+
+    function toggleArt(att) {
+      if (!att) return;
+      setArtOpen(function (prev) {
+        const out = {};
+        Object.keys(prev).forEach(function (id) { out[id] = prev[id]; });
+        out[att.id] = !prev[att.id];
+        return out;
+      });
+    }
+
+    // One chip per attached file, the same markup the approval card draws. A
+    // file that was removed (or a mount that ships no attachment list) still
+    // names itself, disabled.
+    function renderArtifactChip(name, att, open) {
+      return h("div", { className: "ht-row ht-msg-files" },
+        h("button", {
+          type: "button",
+          className: cn("ht-chip ht-file", open && "ht-file-on"),
+          disabled: !att || !att.previewable,
+          title: !att
+            ? name + " is not attached to this card any more"
+            : (att.previewable ? "Read " + name : name + " is not previewable here"),
+          onClick: function () { toggleArt(att); },
+        }, h("span", { className: "ht-chip-dot" }), name || "(unnamed file)")
+      );
+    }
+
     function renderComment(event) {
       const parsed = taggedComment(event.comment.body);
       const mine = isOperator(event.comment.author);
@@ -1838,6 +1882,9 @@
       const detail = eventDetail(row.kind, payload, task);
       const anchored = LOG_KINDS[row.kind] && logAnchor[task.id] === entry.key;
       const open = anchored && logShown(task);
+      const file = row.kind === "attached"
+        ? attachmentOf(task, payload.filename || "") : null;
+      const artShown = !!file && !!artOpen[file.id];
       return h("div", { key: entry.key, className: "ht-msg-event" },
         h("div", { className: "ht-row ht-row-wrap" },
           h("span", { className: cn("ht-tag", "ht-tag-" + (EVENT_TONES[row.kind] || "info")) },
@@ -1853,9 +1900,15 @@
         ),
         row.kind === "completed" && task.summary
           ? h("div", { className: "ht-event-summary" }, task.summary) : null,
+        row.kind === "attached"
+          ? renderArtifactChip(payload.filename || "", file, artShown) : null,
         open ? h(TaskLogPane, {
           key: task.id, task: task, compact: true,
           path: base + encodeURIComponent(task.id) + "/log?tail=" + INLINE_LOG_TAIL,
+        }) : null,
+        artShown ? h(ArtifactView, {
+          key: file.id, slug: props.slug, attachment: file, compact: true,
+          onClose: function () { toggleArt(file); },
         }) : null
       );
     }
@@ -2278,6 +2331,14 @@
       tab === "chat" ? h(ChatThread, {
         slug: slug, rootId: rootId, refreshKey: refreshKey,
       }) : null,
+      // The decision lives where the work is read: the same ApprovalCard the
+      // inbox draws, so the artifacts, the block reason and the verbs are all
+      // here instead of one screen away in Settings.
+      tab === "chat" && waiting ? h(ApprovalCard, {
+        slug: slug, row: waiting, readOnly: props.readOnly,
+        onReadOnly: props.onReadOnly,
+        onDecided: function () { approvalsPoll.reload(); reload(); },
+      }) : null,
       tab === "chat" ? h(Composer, {
         team: team, rootId: rootId,
         answerId: waiting ? waiting.id : null,
@@ -2563,8 +2624,11 @@
     },
   };
 
+  // `compact` is the thread's inline form, like TaskLogPane's: no panel head,
+  // and a shorter pane — a 22 KB design doc must not swallow the timeline.
   function ArtifactView(props) {
     const att = props.attachment;
+    const compact = !!props.compact;
     const [data, setData] = hooks.useState(null);
     const [error, setError] = hooks.useState(null);
 
@@ -2593,17 +2657,23 @@
         (data.note || "This attachment is not text.") +
         (data.stored_path ? " " + data.stored_path : ""));
     } else {
-      body = h("pre", { className: "ht-log" }, data.text || "(empty)");
+      body = h("pre", { className: cn("ht-log", compact && "ht-artifact-inline") },
+        data.text || "(empty)");
     }
 
-    return h("div", { className: "ht-log-pane" },
-      h("div", { className: "ht-panel-head" },
-        h("div", { className: "ht-row" },
-          h("strong", null, att.filename),
-          h(Muted, null, Math.ceil((att.size || 0) / 1024) + " KB")
-        ),
-        h(UI.Button, { size: "sm", outlined: true, onClick: props.onClose }, "Close")
-      ),
+    const size = Math.ceil((att.size || 0) / 1024) + " KB";
+    return h("div", { className: cn("ht-log-pane", compact && "ht-log-pane-inline") },
+      compact
+        ? h("div", { className: "ht-log-bar" },
+            h(Muted, null, att.filename + " · " + size),
+            h(UI.Button, { size: "sm", outlined: true, onClick: props.onClose }, "Close"))
+        : h("div", { className: "ht-panel-head" },
+            h("div", { className: "ht-row" },
+              h("strong", null, att.filename),
+              h(Muted, null, size)
+            ),
+            h(UI.Button, { size: "sm", outlined: true, onClick: props.onClose }, "Close")
+          ),
       body,
       data && data.truncated
         ? h(Muted, null, "Showing the start of the file only — read the rest on disk.")

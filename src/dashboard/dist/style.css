@@ -277,6 +277,8 @@
    name, so the pane keeps only the tail. */
 .ht-log-pane-inline { border: 0; padding: 0; gap: .3rem; }
 .ht-log-inline { max-height: 14rem; }
+/* An artifact is read, not tailed: taller than the log, still inside the thread. */
+.ht-artifact-inline { max-height: 24rem; }
 
 /* ── forms ────────────────────────────────────────────────────────────── */
 .ht-form { display: flex; flex-direction: column; gap: .7rem; }
@@ -555,6 +557,7 @@
   border-left: 2px solid var(--color-border); padding: .1rem 0 .1rem .6rem;
 }
 .ht-event-title { font-size: .84rem; word-break: break-word; }
+.ht-msg-files { flex-wrap: wrap; gap: .3rem; }
 .ht-event-summary {
   white-space: pre-wrap; word-break: break-word;
   font-size: .78rem; color: var(--color-muted-foreground); line-height: 1.45;
