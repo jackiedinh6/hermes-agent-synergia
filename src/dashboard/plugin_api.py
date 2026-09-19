@@ -828,17 +828,24 @@ def get_team_task(request: Request, slug: str, task_id: str):
     ``?comments=true`` adds each card's comments. Opt-in, because it costs a
     second pass over the board: the thread wants them (they ARE the
     conversation — operator notes, approve/reject decisions, agent replies),
-    a status poll does not."""
+    a status poll does not.
+
+    ``?events=true`` adds each card's status transitions (``created``,
+    ``claimed``, ``blocked``, ``completed``, …), the same way and for the same
+    reason: the thread draws one entry per transition at the transition's own
+    time, so a card never moves once it is on screen."""
     resolve = _mod("resolve")
     t, err, _reg, _storage = _team_or_404(slug)
     if err is not None:
         return err
     want_comments = _truthy(request.query_params.get("comments"))
+    want_events = _truthy(request.query_params.get("events"))
     for rid, group in resolve.task_forest(t.board, t.tenant or t.slug).items():
         if any(x.id == task_id for x in group["tasks"]):
             ids = [x.id for x in group["tasks"]]
             comments = (resolve.task_comments(t.board, ids)
                         if want_comments else {})
+            events = resolve.task_events(t.board, ids) if want_events else {}
             rows = []
             for x in group["tasks"]:
                 row = dict(_task_view(x),
@@ -846,6 +853,8 @@ def get_team_task(request: Request, slug: str, task_id: str):
                            summary=group["summaries"].get(x.id))
                 if want_comments:
                     row["comments"] = comments.get(x.id, [])
+                if want_events:
+                    row["events"] = events.get(x.id, [])
                 rows.append(row)
             return _ok({"team": t.slug, "board": t.board, "root_id": rid,
                         "tasks": rows})

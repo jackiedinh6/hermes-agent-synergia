@@ -359,6 +359,50 @@ def test_task_comments_missing_board_is_empty_and_creates_nothing(hermes_root):
     assert not kb.board_dir("ghost-board").exists()
 
 
+# ── task_events (the chat thread's status timeline) ─────────────────────────
+
+def test_task_events_are_status_kinds_only(world):
+    from hermes_cli import kanban_db as kb
+    tid = _carded("proj-board", "evented", [("proj-be", "on it")])
+    with resolve._kanban_conn().connect_closing(board="proj-board") as conn:
+        kb.block_task(conn, tid, reason="needs a key", kind="needs_input")
+    rows = resolve.task_events("proj-board", [tid])[tid]
+    kinds = [e["kind"] for e in rows]
+    # `commented` ships through task_comments; a second copy here would render
+    # every message twice in the thread.
+    assert "commented" not in kinds
+    assert kinds[0] == "created" and "blocked" in kinds
+    assert set(rows[0]) == {"id", "kind", "created_at", "payload"}
+
+
+def test_task_events_payload_is_trimmed_to_the_whitelist(world):
+    tid = _carded("proj-board", "trimmed")
+    created = resolve.task_events("proj-board", [tid])[tid][0]
+    assert created["kind"] == "created"
+    assert set(created["payload"]) <= set(resolve._EVENT_KEYS)
+    # The card's body, skills and workspace never reach a 1s poll.
+    assert "workspace_path" not in created["payload"]
+
+
+def test_task_events_keep_the_newest_within_the_cap(world):
+    from hermes_cli import kanban_db as kb
+    tid = _carded("proj-board", "chatty")
+    with resolve._kanban_conn().connect_closing(board="proj-board") as conn:
+        for i in range(3):
+            kb.block_task(conn, tid, reason=f"r{i}", kind="needs_input")
+            kb.unblock_task(conn, tid)
+    rows = resolve.task_events("proj-board", [tid], limit=2)[tid]
+    assert [e["kind"] for e in rows] == ["blocked", "unblocked"]
+
+
+def test_task_events_missing_board_is_empty_and_creates_nothing(hermes_root):
+    from hermes_cli import kanban_db as kb
+    assert resolve.task_events("ghost-board", ["t_1"]) == {}
+    assert resolve.task_events("ghost-board", []) == {}
+    assert not kb.board_dir("ghost-board").exists()
+    assert not kb.kanban_db_path("ghost-board").exists()
+
+
 # ── project_for ─────────────────────────────────────────────────────────────
 
 def test_project_for_unlinked_is_none(world):

@@ -1563,3 +1563,27 @@ def test_task_tree_carries_comments_only_when_asked(client, steerable):
     row = with_comments["tasks"][0]
     assert [c["body"] for c in row["comments"]] == ["NOTE: go wide"]
     assert row["comments"][0]["author"].startswith("operator")
+
+
+def test_task_tree_carries_events_only_when_asked(client, steerable):
+    """The thread draws one entry per transition, at the transition's own
+    time — so the tree must be able to ship them, and a status poll must not
+    pay for them."""
+    plain = client.get(f"{P}/teams/px/tasks/{steerable}").json()["data"]
+    assert "events" not in plain["tasks"][0]
+    with_events = client.get(
+        f"{P}/teams/px/tasks/{steerable}?events=true").json()["data"]
+    rows = with_events["tasks"][0]["events"]
+    assert [e["kind"] for e in rows][0] == "created"
+    assert [e["created_at"] for e in rows] == sorted(e["created_at"] for e in rows)
+    assert set(rows[0]) == {"id", "kind", "created_at", "payload"}
+
+
+def test_task_tree_events_and_comments_are_independent(client, steerable):
+    client.post(f"{P}/teams/px/tasks/{steerable}/note", json={"text": "go wide"})
+    row = client.get(
+        f"{P}/teams/px/tasks/{steerable}?comments=true&events=true"
+    ).json()["data"]["tasks"][0]
+    assert row["comments"] and "events" in row
+    # The comment is not also an event: one message, one entry in the thread.
+    assert "commented" not in [e["kind"] for e in row["events"]]

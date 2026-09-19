@@ -272,6 +272,11 @@
 }
 .ht-log { max-height: 36rem; }
 .ht-summary { max-height: 10rem; }
+.ht-log-bar { display: flex; align-items: center; justify-content: space-between; gap: .5rem; flex-wrap: wrap; }
+/* Inline in the thread: the entry above already carries the card's border and
+   name, so the pane keeps only the tail. */
+.ht-log-pane-inline { border: 0; padding: 0; gap: .3rem; }
+.ht-log-inline { max-height: 14rem; }
 
 /* ── forms ────────────────────────────────────────────────────────────── */
 .ht-form { display: flex; flex-direction: column; gap: .7rem; }

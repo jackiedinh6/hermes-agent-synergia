@@ -624,6 +624,67 @@ def task_comments(board: str, task_ids, *, limit: int = _COMMENTS_MAX) -> dict:
     return out
 
 
+# The status timeline the chat thread draws: every board event that moves a
+# card between lanes, and nothing else. ``commented`` is excluded on purpose —
+# comments already ship through :func:`task_comments`, and keeping both would
+# render every message twice.
+_EVENT_KINDS = ("created", "dependency_wait", "scheduled", "promoted",
+                "promoted_manual", "claimed", "reclaimed", "blocked",
+                "unblocked", "review_requested", "review_reopened",
+                "changes_requested", "completed", "archived")
+# The thread polls at 1s, and a ``created`` / ``completed`` payload carries the
+# card's body, result, skills and metadata. Only the keys that name a lane or
+# explain a transition travel, each truncated.
+_EVENT_KEYS = ("status", "reason", "parent", "assignee", "actor", "kind", "outcome")
+_EVENT_TEXT_MAX = 200
+_EVENTS_MAX = 100
+
+
+def _event_payload(payload) -> dict:
+    if not isinstance(payload, dict):
+        return {}
+    out = {}
+    for key in _EVENT_KEYS:
+        value = payload.get(key)
+        if value is None:
+            continue
+        out[key] = (value if isinstance(value, (int, float, bool))
+                    else str(value)[:_EVENT_TEXT_MAX])
+    return out
+
+
+def task_events(board: str, task_ids, *, limit: int = _EVENTS_MAX) -> dict:
+    """``{task_id: [{id, kind, created_at, payload}, ...]}`` for *task_ids* —
+    the status transitions of each card, oldest first.
+
+    Only :data:`_EVENT_KINDS` travel and only :data:`_EVENT_KEYS` of each
+    payload: the chat thread turns one row into one entry, and everything else
+    on a card's event log is either noise or already on the wire. Same gate as
+    :func:`task_comments`: a missing or unreadable board DB reads as ``{}`` and
+    is never minted."""
+    ids = [t for t in dict.fromkeys(task_ids or ()) if t]
+    if not ids:
+        return {}
+    db_path = _board_db(board)
+    if db_path is None:
+        return {}
+    kb = _kb()
+    out: dict = {}
+    try:
+        with _kanban_conn().connect_closing(db_path=db_path) as conn:
+            for tid in ids:
+                rows = [e for e in kb.list_events(conn, tid)
+                        if e.kind in _EVENT_KINDS]
+                out[tid] = [
+                    {"id": e.id, "kind": e.kind, "created_at": e.created_at,
+                     "payload": _event_payload(e.payload)}
+                    for e in (rows[-limit:] if limit and limit > 0 else rows)
+                ]
+    except Exception:  # noqa: BLE001 — an unreadable board reads as no events
+        return {}
+    return out
+
+
 # ── busy guard: running cards, stop, resume ─────────────────────────────────
 
 def _board_db(board: str):

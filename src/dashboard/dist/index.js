@@ -332,6 +332,14 @@
     return Math.floor(delta / 86400) + "d";
   }
 
+  // The exact local time behind every relative age: a tooltip, so the thread
+  // keeps reading as "3m" while still answering "3m after what?".
+  function stampOf(epochSeconds) {
+    const ts = Number(epochSeconds || 0);
+    if (!ts) return "";
+    try { return new Date(ts * 1000).toLocaleString(); } catch (e) { return ""; }
+  }
+
   function durationOf(startSeconds, endSeconds) {
     const start = Number(startSeconds || 0);
     if (!start) return "—";
@@ -438,7 +446,9 @@
 
   // ── small presentational pieces ───────────────────────────────────────────
 
-  function Muted(props) { return h("span", { className: "ht-muted" }, props.children); }
+  function Muted(props) {
+    return h("span", { className: "ht-muted", title: props.title }, props.children);
+  }
 
   function Note(props) {
     // tone: info | warn | error | ok
@@ -1596,6 +1606,27 @@
     return { tag: null, text: text };
   }
 
+  // resolve.task_events ships only the kinds that move a card between lanes.
+  // Each row is one line in the thread, at the row's own time — which is why a
+  // card never changes place once it is on screen: it gains a line instead.
+  const EVENT_LABELS = {
+    created: "created", dependency_wait: "waiting", scheduled: "ready",
+    promoted: "ready", promoted_manual: "ready", claimed: "started",
+    reclaimed: "restarted", blocked: "blocked", unblocked: "released",
+    review_requested: "in review", review_reopened: "review reopened",
+    changes_requested: "changes requested", completed: "done",
+    archived: "archived",
+  };
+  const EVENT_TONES = {
+    blocked: "warn", changes_requested: "warn",
+    completed: "ok", unblocked: "ok",
+  };
+  // The entries a worker log can hang under — every other transition has no
+  // run behind it.
+  const LOG_KINDS = { claimed: true, reclaimed: true, completed: true };
+  // The inline log is a tail, polled every 2s: 16 KiB, not the route's 256.
+  const INLINE_LOG_TAIL = 16384;
+
   // approvals.operator_author() writes "operator:<profile>"; every other author
   // on a board is a worker talking.
   function isOperator(author) {
@@ -1666,26 +1697,63 @@
     }));
   }
 
+  // A board whose event rows were pruned (or a mount answering an older shape)
+  // still gets a timeline: every card carries these three timestamps.
+  function derivedEvents(task) {
+    const rows = [{
+      id: 0, kind: "created", created_at: task.created_at,
+      payload: { status: task.started_at ? null : task.status },
+    }];
+    if (task.started_at) {
+      rows.push({ id: 0, kind: "claimed", created_at: task.started_at, payload: {} });
+    }
+    if (task.completed_at) {
+      rows.push({ id: 0, kind: "completed", created_at: task.completed_at, payload: {} });
+    }
+    return rows;
+  }
+
+  function eventDetail(kind, payload, task) {
+    if (kind === "dependency_wait") return payload.parent ? "parent " + payload.parent : null;
+    if (kind === "created") return payload.status || null;
+    if (kind === "completed") {
+      return task.started_at ? durationOf(task.started_at, task.completed_at) : null;
+    }
+    return payload.reason || null;
+  }
+
   function ChatThread(props) {
     const base = "/teams/" + encodeURIComponent(props.slug) + "/tasks/";
     const path = props.rootId
-      ? base + encodeURIComponent(props.rootId) + "?comments=true" : null;
+      ? base + encodeURIComponent(props.rootId) + "?comments=true&events=true" : null;
     // Cadence follows the work, not the clock: 1s only while a card is running
     // or parked, which is the only time the tree changes between ticks.
     const [live, setLive] = hooks.useState(true);
     const poll = usePoll(path, true, [props.refreshKey], live ? THREAD_LIVE_MS : THREAD_IDLE_MS);
-    const [openLog, setOpenLog] = hooks.useState(null);
+    // Per card: true/false is the operator's own choice, absent means "open it
+    // while the card runs" — the running log needs no click, and a collapse
+    // the operator made is never undone by the next poll.
+    const [logOpen, setLogOpen] = hooks.useState({});
     const scrollRef = hooks.useRef(null);
     const follow = hooks.useRef(true);
 
     const run = poll.data;
     const tasks = (run && run.tasks) || [];
     const statuses = tasks.map(function (task) { return task.id + ":" + task.status; }).join(",");
+    // One timeline, one clock: every entry sits at the moment it happened, so
+    // a queued card stays where it was created and a claim adds a line rather
+    // than moving one.
     const events = [];
+    const logAnchor = {};
     tasks.forEach(function (task, index) {
-      events.push({
-        kind: index === 0 ? "root" : "task", task: task,
-        at: Number(task.started_at || task.created_at || 0), seq: events.length,
+      const rows = (task.events && task.events.length) ? task.events : derivedEvents(task);
+      rows.forEach(function (row, rowIndex) {
+        const key = "e" + task.id + ":" + (row.id || row.kind + rowIndex);
+        if (LOG_KINDS[row.kind]) logAnchor[task.id] = key;
+        events.push({
+          kind: "event", task: task, root: index === 0, event: row, key: key,
+          at: Number(row.created_at || task.created_at || 0), seq: events.length,
+        });
       });
       (task.comments || []).forEach(function (comment) {
         events.push({
@@ -1694,7 +1762,15 @@
         });
       });
     });
-    events.sort(function (a, b) { return (a.at - b.at) || (a.seq - b.seq); });
+    events.sort(function (a, b) {
+      if (a.at !== b.at) return a.at - b.at;
+      // task_events ids are one board-wide sequence, so a same-second burst
+      // across cards still reads in the order the board recorded it.
+      const ia = a.kind === "event" ? Number(a.event.id || 0) : 0;
+      const ib = b.kind === "event" ? Number(b.event.id || 0) : 0;
+      if (ia && ib && ia !== ib) return ia - ib;
+      return a.seq - b.seq;
+    });
 
     hooks.useEffect(function () {
       setLive(tasks.some(function (task) {
@@ -1709,6 +1785,21 @@
 
     hooks.useEffect(function () { follow.current = true; }, [props.rootId]);
 
+    function logShown(task) {
+      const choice = logOpen[task.id];
+      return choice === undefined ? task.status === "running" : choice;
+    }
+
+    function toggleLog(task) {
+      const next = !logShown(task);
+      setLogOpen(function (prev) {
+        const out = {};
+        Object.keys(prev).forEach(function (id) { out[id] = prev[id]; });
+        out[task.id] = next;
+        return out;
+      });
+    }
+
     function renderComment(event) {
       const parsed = taggedComment(event.comment.body);
       const mine = isOperator(event.comment.author);
@@ -1721,42 +1812,50 @@
           parsed.tag
             ? h("span", { className: cn("ht-tag", "ht-tag-" + parsed.tag.tone) }, parsed.tag.label)
             : null,
-          h(Muted, null, ageOf(event.comment.created_at))
+          h(Muted, { title: stampOf(event.comment.created_at) }, ageOf(event.comment.created_at))
         ),
         h("div", { className: "ht-msg-body" }, parsed.text)
       );
     }
 
-    function renderRoot(event) {
-      return h("div", { key: "r" + event.task.id, className: "ht-msg ht-msg-operator" },
+    // The root card's `created` event IS the operator's prompt — the one entry
+    // that reads as a message rather than a transition.
+    function renderPrompt(entry) {
+      return h("div", { key: entry.key, className: "ht-msg ht-msg-operator" },
         h("div", { className: "ht-msg-head" },
           h("span", { className: "ht-msg-who" }, "you"),
           h("span", { className: "ht-tag ht-tag-info" }, "task"),
-          h(Muted, null, ageOf(event.task.created_at))
+          h(Muted, { title: stampOf(entry.event.created_at) }, ageOf(entry.event.created_at))
         ),
-        h("div", { className: "ht-msg-body" }, event.task.title || event.task.id)
+        h("div", { className: "ht-msg-body" }, entry.task.title || entry.task.id)
       );
     }
 
-    function renderTask(event) {
-      const task = event.task;
-      const open = openLog === task.id;
-      return h("div", { key: "t" + task.id, className: "ht-msg-event" },
+    function renderEvent(entry) {
+      const task = entry.task;
+      const row = entry.event;
+      const payload = row.payload || {};
+      const detail = eventDetail(row.kind, payload, task);
+      const anchored = LOG_KINDS[row.kind] && logAnchor[task.id] === entry.key;
+      const open = anchored && logShown(task);
+      return h("div", { key: entry.key, className: "ht-msg-event" },
         h("div", { className: "ht-row ht-row-wrap" },
-          h(StatusChip, { status: task.status }),
+          h("span", { className: cn("ht-tag", "ht-tag-" + (EVENT_TONES[row.kind] || "info")) },
+            EVENT_LABELS[row.kind] || row.kind),
           h("span", { className: "ht-event-title" }, task.title || task.id),
-          h(AssigneeChip, { assignee: task.assignee }),
-          h(Muted, null, task.started_at
-            ? durationOf(task.started_at, task.completed_at) : "queued"),
-          h("button", {
+          task.assignee ? h(AssigneeChip, { assignee: task.assignee }) : null,
+          detail ? h(Muted, null, detail) : null,
+          h(Muted, { title: stampOf(row.created_at) }, ageOf(row.created_at)),
+          anchored ? h("button", {
             type: "button", className: "ht-expander",
-            onClick: function () { setOpenLog(open ? null : task.id); },
-          }, (open ? "▾ " : "▸ ") + "worker log")
+            onClick: function () { toggleLog(task); },
+          }, (open ? "▾ " : "▸ ") + "worker log") : null
         ),
-        task.summary ? h("div", { className: "ht-event-summary" }, task.summary) : null,
+        row.kind === "completed" && task.summary
+          ? h("div", { className: "ht-event-summary" }, task.summary) : null,
         open ? h(TaskLogPane, {
-          key: task.id, task: task,
-          path: base + encodeURIComponent(task.id) + "/log",
+          key: task.id, task: task, compact: true,
+          path: base + encodeURIComponent(task.id) + "/log?tail=" + INLINE_LOG_TAIL,
         }) : null
       );
     }
@@ -1772,8 +1871,8 @@
     } else {
       body = events.map(function (event) {
         if (event.kind === "comment") return renderComment(event);
-        if (event.kind === "root") return renderRoot(event);
-        return renderTask(event);
+        if (event.root && event.event.kind === "created") return renderPrompt(event);
+        return renderEvent(event);
       });
     }
 
@@ -2208,8 +2307,11 @@
     );
   }
 
+  // `compact` is the thread's inline form: no head, no summary block — the
+  // entry above it already names the card — just the tail and its controls.
   function TaskLogPane(props) {
     const task = props.task;
+    const compact = !!props.compact;
     const poll = usePoll(props.path, task.status === "running", null, LOG_POLL_MS);
     const log = poll.data;
     const preRef = hooks.useRef(null);
@@ -2230,7 +2332,7 @@
         "The card has not started, or its log was rotated away.");
     } else {
       body = h("pre", {
-        ref: preRef, className: "ht-log",
+        ref: preRef, className: cn("ht-log", compact && "ht-log-inline"),
         onScroll: function (e) {
           const el = e.currentTarget;
           follow.current = el.scrollHeight - el.scrollTop - el.clientHeight < 24;
@@ -2238,8 +2340,8 @@
       }, log.content || "(empty)");
     }
 
-    return h("div", { className: "ht-log-pane" },
-      h("div", { className: "ht-panel-head" },
+    return h("div", { className: cn("ht-log-pane", compact && "ht-log-pane-inline") },
+      compact ? null : h("div", { className: "ht-panel-head" },
         h("div", null,
           h("div", { className: "ht-row" },
             h("code", { className: "ht-code" }, task.id),
@@ -2251,10 +2353,17 @@
           h(UI.Button, { size: "sm", outlined: true, onClick: poll.reload }, "Refresh")
         )
       ),
-      task.summary ? h("div", { className: "ht-kicker" }, "Summary") : null,
-      task.summary ? h("pre", { className: "ht-summary" }, task.summary) : null,
-      h("div", { className: "ht-kicker" },
-        "Worker log" + (task.assignee ? " · " + task.assignee : "")),
+      !compact && task.summary ? h("div", { className: "ht-kicker" }, "Summary") : null,
+      !compact && task.summary ? h("pre", { className: "ht-summary" }, task.summary) : null,
+      h("div", { className: "ht-log-bar" },
+        h("div", { className: "ht-kicker" },
+          "Worker log" + (task.assignee ? " · " + task.assignee : "")),
+        compact ? h("div", { className: "ht-row" },
+          log && log.exists ? h(Muted, null, Math.ceil(log.size_bytes / 1024) + " KB") : null,
+          task.status === "running" ? h(Muted, null, "live · every 2s") : null,
+          h(UI.Button, { size: "sm", ghost: true, onClick: poll.reload }, "Refresh")
+        ) : null
+      ),
       body,
       log && log.truncated
         ? h(Muted, null, "Showing the end of the log. Full log: ",
