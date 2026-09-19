@@ -53,6 +53,11 @@ QUEUE_KINDS = (NEEDS_INPUT, STUCK)
 APPROVE_PREFIX = "APPROVED"
 REJECT_PREFIX = "CHANGES REQUESTED"
 RELEASE_PREFIX = "RELEASED"
+NOTE_PREFIX = "NOTE"
+
+# A card the operator may still steer: not finished, not parked on anyone.
+RUNNING_STATUS = "running"
+DONE_STATUS = "done"
 
 _HEADLINE_MAX = 240
 # Artifact preview cap, same idiom as the dashboard log tail.
@@ -431,6 +436,47 @@ def _require_stuck(t, task) -> None:
     )
 
 
+def _require_open(t, task) -> None:
+    """A card a note can still reach: not finished, not parked on a decision.
+
+    A blocked card is refused on purpose. The comment would land, the card
+    would stay blocked, and the operator would read the thread as answered —
+    so each blocked lane is pointed at the verb that actually moves it.
+    """
+    if is_pending(task):
+        raise TeamError(
+            E_TEAM_INVALID,
+            f"card {task.id} is waiting on a human decision, not running",
+            hint="A note leaves the card blocked. Approving or rejecting is "
+                 "what returns it to the pool with your text attached.",
+            remedy=f'hermes team approve {task.id} --note "…"',
+        )
+    if is_stuck(task):
+        raise TeamError(
+            E_TEAM_INVALID,
+            f"card {task.id} is stuck ({_stuck_cause(task)}), not running",
+            hint="A note leaves the card blocked. Releasing it returns it to "
+                 "the pool for another run with your text attached.",
+            remedy=f'hermes team release {task.id} --note "…"',
+        )
+    if task.status == DONE_STATUS:
+        raise TeamError(
+            E_TEAM_INVALID,
+            f"card {task.id} is done — nothing is running to steer",
+            hint="A finished card never runs again, so a note on it reaches "
+                 "nobody. Start a new card for the follow-up work.",
+            remedy=f"hermes team status {t.slug}",
+        )
+
+
+_TEXT_FLAG = {"reject": "reason", "note": "text"}
+_TEXT_HINT = {
+    "note": "Say what the agent should take into account; it is steered into "
+            "the run while it works.",
+}
+_DEFAULT_TEXT_HINT = "Say what you decided — the agent resumes by reading it."
+
+
 def _require_text(action: str, task_id: str, text) -> str:
     """The decision text, or a refusal. An empty note is the one input that
     would leave the agent resuming with nothing to act on."""
@@ -438,10 +484,10 @@ def _require_text(action: str, task_id: str, text) -> str:
     if not text:
         raise TeamError(
             E_TEAM_INVALID,
-            f"{action} needs a decision text",
-            hint="Say what you decided — the agent resumes by reading it.",
+            f"{action} needs text",
+            hint=_TEXT_HINT.get(action, _DEFAULT_TEXT_HINT),
             remedy=f"hermes team {action} {task_id} "
-                   f"--{'reason' if action == 'reject' else 'note'} \"…\"",
+                   f"--{_TEXT_FLAG.get(action, 'note')} \"…\"",
         )
     return text
 
@@ -506,6 +552,29 @@ def release(t, task_id: str, note: str, *, author=None) -> dict:
     return _decide(t, task_id, body=f"{RELEASE_PREFIX}: {note}",
                    author=author, unblock=True, action="release",
                    require=_require_stuck)
+
+
+def note(t, task_id: str, text: str, *, author=None) -> dict:
+    """Steer a card that is already moving: comment, and nothing else.
+
+    No unblock, no status change — the delivery path is the substrate's own
+    live bridge. A worker polls its card for comments it has not seen
+    (``tools/kanban_tools.inject_new_comments_from_env``, every ≥6s) and
+    steers them into the running agent out-of-band, so an operator can talk
+    to a running task without the block → comment → unblock detour. On a card
+    that is not running yet the comment simply waits in the card's history,
+    which its next run reads as context.
+
+    ``delivery`` says which of the two happened, because the operator needs to
+    know whether the agent hears this now or at the next run.
+    """
+    text = _require_text("note", task_id, text)
+    res = _decide(t, task_id, body=f"{NOTE_PREFIX}: {text}",
+                  author=author, unblock=False, action="note",
+                  require=_require_open)
+    res["delivery"] = ("mid-run" if res["status"] == RUNNING_STATUS
+                       else "next_run")
+    return res
 
 
 # ── messenger push (the kanban_task_blocked / dispatch_tick observers) ───────

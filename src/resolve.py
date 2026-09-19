@@ -590,6 +590,40 @@ def task_forest(board: str, tenant: Optional[str] = None) -> dict:
     return forest
 
 
+# Per-card comment cap: a long-running card accumulates operator notes and
+# agent replies, and the chat thread only ever renders the recent end of it.
+_COMMENTS_MAX = 200
+
+
+def task_comments(board: str, task_ids, *, limit: int = _COMMENTS_MAX) -> dict:
+    """``{task_id: [{id, author, body, created_at}, ...]}`` for *task_ids*.
+
+    The newest ``limit`` per card, oldest first — a thread reads forwards but
+    an old card's history is not worth shipping in full. Same gate as
+    :func:`task_forest`: a missing or unreadable board DB reads as ``{}`` and
+    is never minted."""
+    ids = [t for t in dict.fromkeys(task_ids or ()) if t]
+    if not ids:
+        return {}
+    db_path = _board_db(board)
+    if db_path is None:
+        return {}
+    kb = _kb()
+    out: dict = {}
+    try:
+        with _kanban_conn().connect_closing(db_path=db_path) as conn:
+            for tid in ids:
+                rows = kb.list_comments(conn, tid)
+                out[tid] = [
+                    {"id": c.id, "author": c.author, "body": c.body,
+                     "created_at": c.created_at}
+                    for c in (rows[-limit:] if limit and limit > 0 else rows)
+                ]
+    except Exception:  # noqa: BLE001 — an unreadable board reads as no comments
+        return {}
+    return out
+
+
 # ── busy guard: running cards, stop, resume ─────────────────────────────────
 
 def _board_db(board: str):

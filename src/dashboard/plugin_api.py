@@ -820,21 +820,35 @@ def _task_404(t, task_id: str) -> JSONResponse:
 
 
 @router.get("/teams/{slug}/tasks/{task_id}")
-def get_team_task(slug: str, task_id: str):
+def get_team_task(request: Request, slug: str, task_id: str):
     """One started task and all its subtasks, in execution order — the
-    activity panel's detail view. A subtask id answers with the tree it
-    belongs to. Read-only: ``resolve.task_forest`` never mints the DB."""
+    chat thread's detail view. A subtask id answers with the tree it
+    belongs to. Read-only: ``resolve.task_forest`` never mints the DB.
+
+    ``?comments=true`` adds each card's comments. Opt-in, because it costs a
+    second pass over the board: the thread wants them (they ARE the
+    conversation — operator notes, approve/reject decisions, agent replies),
+    a status poll does not."""
     resolve = _mod("resolve")
     t, err, _reg, _storage = _team_or_404(slug)
     if err is not None:
         return err
+    want_comments = _truthy(request.query_params.get("comments"))
     for rid, group in resolve.task_forest(t.board, t.tenant or t.slug).items():
         if any(x.id == task_id for x in group["tasks"]):
+            ids = [x.id for x in group["tasks"]]
+            comments = (resolve.task_comments(t.board, ids)
+                        if want_comments else {})
+            rows = []
+            for x in group["tasks"]:
+                row = dict(_task_view(x),
+                           parents=group["parents"].get(x.id, []),
+                           summary=group["summaries"].get(x.id))
+                if want_comments:
+                    row["comments"] = comments.get(x.id, [])
+                rows.append(row)
             return _ok({"team": t.slug, "board": t.board, "root_id": rid,
-                        "tasks": [dict(_task_view(x),
-                                       parents=group["parents"].get(x.id, []),
-                                       summary=group["summaries"].get(x.id))
-                                  for x in group["tasks"]]})
+                        "tasks": rows})
     return _task_404(t, task_id)
 
 
@@ -1011,6 +1025,38 @@ async def post_team_task_release(request: Request, slug: str, task_id: str):
     decision: that one is approved or rejected, so the decision reaches the
     agent as a decision."""
     return await _decision_route(request, slug, task_id, action="release")
+
+
+@router.post("/teams/{slug}/tasks/{task_id}/note")
+async def post_team_task_note(request: Request, slug: str, task_id: str):
+    """``{text}`` — steer a card that is already moving: comment, no unblock.
+
+    No ``confirm`` token: g5 guards the destructive verbs, and this one only
+    appends a comment, exactly like ``POST /teams/{slug}/tasks``. The worker
+    picks it up through the substrate's live comment bridge, so ``delivery``
+    in the payload says whether the agent hears it mid-run or at its next run.
+    """
+    approvals = _mod("approvals")
+    guard = _mutation_guard(request)
+    if guard is not None:
+        return guard
+    body = await _body(request)
+    if isinstance(body, JSONResponse):
+        return body
+    t, err, _reg, _storage = _team_or_404(slug)
+    if err is not None:
+        return err
+    text = body.get("text")
+    if not isinstance(text, str) or not text.strip():
+        return _json(400, _env(
+            "E_TEAM_INVALID", "text is required",
+            hint='{"text": "…"} — what the agent should take into account.',
+            remedy=f'hermes team note {task_id} --text "…"'))
+    try:
+        payload = await _thread(lambda: approvals.note(t, task_id, text))
+    except Exception as exc:                                # noqa: BLE001
+        return _team_err(exc)
+    return _ok(payload)
 
 
 @router.get("/teams/{slug}/drift")

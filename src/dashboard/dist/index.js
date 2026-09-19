@@ -1493,161 +1493,27 @@
     );
   }
 
-  // ═══════════════════════════════════════════════════════════════════════════
-  // Start work panel — POST /teams/{slug}/tasks
-  // ═══════════════════════════════════════════════════════════════════════════
-
-  function StartWorkPanel(props) {
-    const team = props.team;
-    // Default assignee = the team's main profile, which is the record's
-    // orchestrator and nothing else — the same fallback post_team_task()
-    // itself applies (assignee = t.orchestrator). NOT member.primary: managed
-    // members are all primary, so it would pick an arbitrary one. The
-    // dropdown is populated ONLY from the roster — a non-member is refused
-    // with E_TEAM_NOT_MEMBER.
-    const mainProfile = team.orchestrator ||
-      ((team.members || [])[0] || {}).profile || "";
-
-    const [title, setTitle] = hooks.useState("");
-    const [taskBody, setTaskBody] = hooks.useState("");
-    const [priority, setPriority] = hooks.useState("0");
-    const [assignee, setAssignee] = hooks.useState(mainProfile);
-    const [skills, setSkills] = hooks.useState([]);
-    const [skillRows, setSkillRows] = hooks.useState(null);
-    const [skillError, setSkillError] = hooks.useState(null);
-    const [busy, setBusy] = hooks.useState(false);
-    const [error, setError] = hooks.useState(null);
-    const [created, setCreated] = hooks.useState(null);
-
-    hooks.useEffect(function () { setAssignee(mainProfile); }, [mainProfile]);
-
-    hooks.useEffect(function () {
-      if (!assignee) { setSkillRows([]); return undefined; }
-      let cancelled = false;
-      setSkillRows(null);
-      setSkillError(null);
-      apiGet("/skills?profile=" + encodeURIComponent(assignee)).then(function (data) {
-        if (cancelled) return;
-        setSkillRows((data && data.skills) || []);
-      }, function (err) {
-        if (cancelled) return;
-        setSkillRows([]);
-        setSkillError(describeError(err, "The skill list"));
-      });
-      return function () { cancelled = true; };
-    }, [assignee]);
-
-    function toggleSkill(name) {
-      setSkills(function (current) {
-        const at = current.indexOf(name);
-        if (at < 0) return current.concat([name]);
-        const next = current.slice();
-        next.splice(at, 1);
-        return next;
-      });
-    }
-
-    function submit() {
-      setBusy(true);
-      setError(null);
-      setCreated(null);
-      // Body keys read by post_team_task(): title, body, assignee (or role),
-      // priority, skills, parents. Board / tenant / workspace come from the
-      // record — never from here. No expected_revision: this route writes the
-      // board DB, not teams.yaml, so gating it on the registry revision would
-      // fail a task for an unrelated roster edit.
-      apiSend("POST", "/teams/" + encodeURIComponent(team.slug) + "/tasks", {
-        title: title,
-        body: taskBody || null,
-        assignee: assignee,
-        priority: Number(priority) || 0,
-        skills: skills,
-      }).then(function (data) {
-        setBusy(false);
-        setCreated(data || null);
-        setTitle("");
-        setTaskBody("");
-        setSkills([]);
-        props.onCreated();
-      }, function (err) {
-        setBusy(false);
-        setError(err);
-        if (isReadOnly(err)) props.onReadOnly();
-      });
-    }
-
-    return h("div", { className: "ht-panel" },
-      h("div", { className: "ht-panel-head" },
-        h("h3", null, "Start work"),
-        h(Muted, null, "queued on the board as a card the dispatcher picks up")
-      ),
-      props.readOnly ? h(Note, { tone: "warn", title: "Read-only dashboard" }, READONLY_MESSAGE) : null,
-      created ? h(Note, { tone: "ok", title: "Card created" },
-        "Task " + created.task_id + " on board " + created.board +
-        " assigned to " + (created.assignee || "nobody") + ".") : null,
-      error ? h(ErrorNote, { error: error, what: "This team" }) : null,
-      h("div", { className: "ht-form" },
-        h(TextField, {
-          id: "ht-task-title", label: "Title", value: title, onChange: setTitle,
-          disabled: props.readOnly,
-        }),
-        h(Field, { label: "Body", htmlFor: "ht-task-body" },
-          h("textarea", {
-            id: "ht-task-body",
-            className: "ht-textarea",
-            rows: 5,
-            value: taskBody,
-            disabled: props.readOnly,
-            onChange: function (e) { setTaskBody(e.target.value); },
-          })
-        ),
-        h("div", { className: "ht-grid-2" },
-          h(Field, { label: "Assignee", htmlFor: "ht-task-assignee",
-            hint: "Roster only; defaults to the team's main profile." },
-            h(UI.Select, {
-              id: "ht-task-assignee",
-              value: assignee,
-              disabled: props.readOnly,
-              onValueChange: setAssignee,
-            }, (team.members || []).map(function (m) {
-              return h(UI.SelectOption, { key: m.profile, value: m.profile },
-                m.profile + (m.profile === mainProfile ? " (main)" : "") + " · " + (m.role || "member"));
-            }))
-          ),
-          h(TextField, {
-            id: "ht-task-priority", label: "Priority", type: "number",
-            value: priority, onChange: setPriority, disabled: props.readOnly,
-            hint: "Higher runs first.",
-          })
-        ),
-        h(Field, { label: "Skills for this card",
-          hint: "Installed skills of " + (assignee || "—") + "." },
-          h(SkillPicker, {
-            skills: skillRows, selected: skills, error: skillError, onToggle: toggleSkill,
-          })
-        ),
-        h("div", { className: "ht-row ht-row-end" },
-          h(UI.Button, {
-            disabled: props.readOnly || busy || !title.trim() || !assignee,
-            onClick: submit,
-          }, busy ? "Queuing…" : "Start work")
-        )
-      )
-    );
+  function isHidden() {
+    return typeof document !== "undefined" && document.visibilityState === "hidden";
   }
-
-  // ═══════════════════════════════════════════════════════════════════════════
-  // Activity panel — polled GET /teams/{slug}/status. A started task opens
-  // its run: GET /teams/{slug}/tasks/{id}, and GET …/tasks/{id}/log per card.
-  // ═══════════════════════════════════════════════════════════════════════════
 
   // Poll, don't socket: a team board is low-traffic and polling has no
   // reconnect story to get wrong. Cleared on unmount / path change.
-  // `extraDeps` must keep the same length across renders.
-  function usePoll(path, active, extraDeps) {
+  // `extraDeps` must keep the same length across renders. `intervalMs`
+  // defaults to 5s; the chat thread asks for 1s while work moves, which is
+  // also why a hidden tab stops polling entirely — a 1s poll behind another
+  // tab is load on the host nobody is reading. A null `path` polls nothing.
+  function usePoll(path, active, extraDeps, intervalMs) {
     const [data, setData] = hooks.useState(null);
     const [error, setError] = hooks.useState(null);
     const [nonce, setNonce] = hooks.useState(0);
+    const [visible, setVisible] = hooks.useState(!isHidden());
+    const every = intervalMs || 5000;
+    hooks.useEffect(function () {
+      function onVisibility() { setVisible(!isHidden()); }
+      document.addEventListener("visibilitychange", onVisibility);
+      return function () { document.removeEventListener("visibilitychange", onVisibility); };
+    }, []);
     hooks.useEffect(function () {
       let cancelled = false;
       function tick() {
@@ -1659,10 +1525,11 @@
           if (!cancelled) setError(err);
         });
       }
+      if (!path) return function () { cancelled = true; };
       tick();
-      const timer = active ? setInterval(tick, 5000) : null;
+      const timer = active && visible ? setInterval(tick, every) : null;
       return function () { cancelled = true; if (timer) clearInterval(timer); };
-    }, [path, active, nonce].concat(extraDeps || []));
+    }, [path, active, visible, every, nonce].concat(extraDeps || []));
     return {
       data: data, error: error,
       reload: function () { setNonce(function (n) { return n + 1; }); },
@@ -1690,225 +1557,660 @@
     };
   }
 
-  function TaskCell(props) {
-    return h("td", null,
-      h("code", { className: "ht-code" }, String(props.task.id).slice(0, 8)),
-      " ",
-      h("span", { className: "ht-task-title" }, props.task.title || "")
+  // ═══════════════════════════════════════════════════════════════════════════
+  // Chat — the product surface. One team, one thread, four routes:
+  //   GET  /teams/{slug}/status                     lanes + started tasks
+  //   GET  /teams/{slug}/tasks/{root}?comments=true the thread itself
+  //   GET  /teams/{slug}/approvals                  which card wants an answer
+  //   POST /teams/{slug}/tasks                      a new card
+  //   POST /teams/{slug}/tasks/{id}/note            steer the running card
+  //   POST /teams/{slug}/tasks/{id}/approve|reject  answer a parked one
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  const THREAD_LIVE_MS = 1000;      // work is moving — the operator is watching
+  const THREAD_IDLE_MS = 5000;
+  const BOARD_POLL_MS = 3000;
+  const BOARD_FOCUS_MS = 2000;      // the Kanban tab IS the board
+  const LOG_POLL_MS = 2000;
+  // Every lane a team can still be doing something in. `done` is the only one
+  // that does not hold the working folder hostage.
+  const OPEN_LANES = ["todo", "ready", "running", "review", "blocked"];
+  const TEAM_KEY = "hermes-agent-synergia.team";
+
+  // approvals.py stamps every operator comment with its verb, so a recorded
+  // decision does not read as ordinary chatter in the thread.
+  const COMMENT_TAGS = [
+    { prefix: "APPROVED: ", label: "approved", tone: "ok" },
+    { prefix: "CHANGES REQUESTED: ", label: "changes requested", tone: "warn" },
+    { prefix: "RELEASED: ", label: "released", tone: "ok" },
+    { prefix: "NOTE: ", label: "steer", tone: "info" },
+  ];
+
+  function taggedComment(body) {
+    const text = String(body === undefined || body === null ? "" : body);
+    for (let i = 0; i < COMMENT_TAGS.length; i++) {
+      if (text.indexOf(COMMENT_TAGS[i].prefix) === 0) {
+        return { tag: COMMENT_TAGS[i], text: text.slice(COMMENT_TAGS[i].prefix.length) };
+      }
+    }
+    return { tag: null, text: text };
+  }
+
+  // approvals.operator_author() writes "operator:<profile>"; every other author
+  // on a board is a worker talking.
+  function isOperator(author) {
+    return String(author || "").indexOf("operator") === 0;
+  }
+
+  function openLanes(counts) {
+    return OPEN_LANES.filter(function (lane) { return Number((counts || {})[lane] || 0) > 0; });
+  }
+
+  function rememberTeam(slug) {
+    // A remembered selection is a convenience, never state the UI depends on:
+    // private windows and blocked site data both throw here.
+    try { window.localStorage.setItem(TEAM_KEY, slug); } catch (e) { /* not critical */ }
+  }
+
+  function rememberedTeam() {
+    try { return window.localStorage.getItem(TEAM_KEY) || null; } catch (e) { return null; }
+  }
+
+  function TeamRail(props) {
+    const teams = props.teams || [];
+    return h("div", { className: "ht-rail" },
+      h("div", { className: "ht-rail-head" },
+        h("span", { className: "ht-kicker" }, "teams"),
+        h(UI.Button, { size: "sm", ghost: true, onClick: props.onReload }, "Reload")
+      ),
+      teams.length
+        ? h("div", { className: "ht-rail-list" }, teams.map(function (row) {
+            const counts = row.counts || {};
+            const running = Number(counts.running || 0);
+            const blocked = Number(counts.blocked || 0);
+            return h("button", {
+              key: row.slug,
+              type: "button",
+              className: cn("ht-rail-item", props.selected === row.slug && "ht-rail-item-on"),
+              title: row.workdir || row.slug,
+              onClick: function () { props.onSelect(row.slug); },
+            },
+              h("span", { className: "ht-rail-name" }, row.display_name || row.slug),
+              h("span", { className: "ht-rail-meta" },
+                running
+                  ? h("span", { className: "ht-dot ht-lane-running", title: running + " running" })
+                  : null,
+                blocked
+                  ? h("span", { className: "ht-dot ht-lane-blocked", title: blocked + " blocked" })
+                  : null,
+                h(Muted, null, row.members + (row.members === 1 ? " member" : " members"))
+              )
+            );
+          }))
+        : h("p", { className: "ht-hint" }, "No teams yet — create one in Settings.")
     );
   }
 
-  function ActivityPanel(props) {
-    const [openTask, setOpenTask] = hooks.useState(null);
-    hooks.useEffect(function () { setOpenTask(null); }, [props.team.slug]);
-    if (openTask) {
-      return h(TaskRunView, {
-        team: props.team, taskId: openTask, rootRef: props.rootRef,
-        onBack: function () { setOpenTask(null); },
-      });
-    }
-    return h(ActivityList, {
-      team: props.team, refreshKey: props.refreshKey, rootRef: props.rootRef,
-      onOpen: setOpenTask,
-    });
+  function ThreadPicker(props) {
+    const roots = props.roots || [];
+    if (roots.length < 2) return null;
+    return h(UI.Select, {
+      id: "ht-thread-picker",
+      className: "ht-thread-picker",
+      value: props.value || "",
+      onValueChange: props.onChange,
+    }, roots.map(function (root) {
+      const task = props.byId[root.id] || {};
+      return h(UI.SelectOption, { key: root.id, value: root.id },
+        (task.title || root.id) + " · " + root.done + "/" + root.total);
+    }));
   }
 
-  function ActivityList(props) {
-    const slug = props.team.slug;
-    const poll = usePoll("/teams/" + encodeURIComponent(slug) + "/status", true,
-      [props.refreshKey]);
-    const status = poll.data;
-    const error = poll.error ? describeError(poll.error, "This team") : null;
+  function ChatThread(props) {
+    const base = "/teams/" + encodeURIComponent(props.slug) + "/tasks/";
+    const path = props.rootId
+      ? base + encodeURIComponent(props.rootId) + "?comments=true" : null;
+    // Cadence follows the work, not the clock: 1s only while a card is running
+    // or parked, which is the only time the tree changes between ticks.
+    const [live, setLive] = hooks.useState(true);
+    const poll = usePoll(path, true, [props.refreshKey], live ? THREAD_LIVE_MS : THREAD_IDLE_MS);
+    const [openLog, setOpenLog] = hooks.useState(null);
+    const scrollRef = hooks.useRef(null);
+    const follow = hooks.useRef(true);
 
-    if (error && !status) return h(Note, { tone: "error", title: "Activity unavailable" }, error);
-    if (!status) return h(Loading, { label: "Reading the board…" });
-
-    const tasks = status.tasks || [];
-    const byId = {};
-    const byLane = {};
-    LANES.forEach(function (lane) { byLane[lane] = []; });
-    const other = [];
-    tasks.forEach(function (task) {
-      byId[task.id] = task;
-      if (byLane[task.status]) byLane[task.status].push(task);
-      else other.push(task);
+    const run = poll.data;
+    const tasks = (run && run.tasks) || [];
+    const statuses = tasks.map(function (task) { return task.id + ":" + task.status; }).join(",");
+    const events = [];
+    tasks.forEach(function (task, index) {
+      events.push({
+        kind: index === 0 ? "root" : "task", task: task,
+        at: Number(task.started_at || task.created_at || 0), seq: events.length,
+      });
+      (task.comments || []).forEach(function (comment) {
+        events.push({
+          kind: "comment", task: task, comment: comment,
+          at: Number(comment.created_at || 0), seq: events.length,
+        });
+      });
     });
+    events.sort(function (a, b) { return (a.at - b.at) || (a.seq - b.seq); });
 
-    function open(task) {
-      return function () { props.onOpen(task.root_id || task.id); };
-    }
+    hooks.useEffect(function () {
+      setLive(tasks.some(function (task) {
+        return task.status === "running" || task.status === "blocked";
+      }));
+    }, [statuses]);
 
-    function rootsBlock() {
-      const roots = (status.roots || []).filter(function (r) { return byId[r.id]; });
-      if (!roots.length) return null;
-      return h("div", { key: "roots", className: "ht-lane" },
-        h("div", { className: "ht-lane-head" },
-          h("span", { className: "ht-lane-name" }, "started tasks"),
-          h("span", { className: "ht-lane-count" }, roots.length),
-          h(Muted, null, "open one to see its subtasks and logs")
+    hooks.useEffect(function () {
+      const el = scrollRef.current;
+      if (el && follow.current) el.scrollTop = el.scrollHeight;
+    }, [events.length, props.rootId]);
+
+    hooks.useEffect(function () { follow.current = true; }, [props.rootId]);
+
+    function renderComment(event) {
+      const parsed = taggedComment(event.comment.body);
+      const mine = isOperator(event.comment.author);
+      return h("div", {
+        key: "c" + event.comment.id,
+        className: cn("ht-msg", mine ? "ht-msg-operator" : "ht-msg-agent"),
+      },
+        h("div", { className: "ht-msg-head" },
+          h("span", { className: "ht-msg-who" }, mine ? "you" : (event.comment.author || "agent")),
+          parsed.tag
+            ? h("span", { className: cn("ht-tag", "ht-tag-" + parsed.tag.tone) }, parsed.tag.label)
+            : null,
+          h(Muted, null, ageOf(event.comment.created_at))
         ),
-        h("div", { className: "ht-table-wrap" },
-          h("table", { className: "ht-table" },
-            h("thead", null, h("tr", null,
-              h("th", null, "task"),
-              h("th", null, "status"),
-              h("th", null, "assignee"),
-              h("th", null, "subtasks done"),
-              h("th", null, "age")
-            )),
-            h("tbody", null, roots.map(function (r) {
-              const task = byId[r.id];
-              return h("tr", clickableRow(r.id, false, open(task), "Show this task's run"),
-                h(TaskCell, { task: task }),
-                h("td", null, h(StatusChip, { status: task.status })),
-                h("td", null, h(AssigneeChip, { assignee: task.assignee })),
-                h("td", null, r.done + "/" + r.total),
-                h("td", null, ageOf(task.created_at))
-              );
-            }))
-          )
-        )
+        h("div", { className: "ht-msg-body" }, parsed.text)
       );
     }
 
-    function laneBlock(lane, rows) {
-      if (!rows.length) return null;
-      return h("div", { key: lane, className: cn("ht-lane", "ht-lane-" + lane) },
-        h("div", { className: "ht-lane-head" },
+    function renderRoot(event) {
+      return h("div", { key: "r" + event.task.id, className: "ht-msg ht-msg-operator" },
+        h("div", { className: "ht-msg-head" },
+          h("span", { className: "ht-msg-who" }, "you"),
+          h("span", { className: "ht-tag ht-tag-info" }, "task"),
+          h(Muted, null, ageOf(event.task.created_at))
+        ),
+        h("div", { className: "ht-msg-body" }, event.task.title || event.task.id)
+      );
+    }
+
+    function renderTask(event) {
+      const task = event.task;
+      const open = openLog === task.id;
+      return h("div", { key: "t" + task.id, className: "ht-msg-event" },
+        h("div", { className: "ht-row ht-row-wrap" },
+          h(StatusChip, { status: task.status }),
+          h("span", { className: "ht-event-title" }, task.title || task.id),
+          h(AssigneeChip, { assignee: task.assignee }),
+          h(Muted, null, task.started_at
+            ? durationOf(task.started_at, task.completed_at) : "queued"),
+          h("button", {
+            type: "button", className: "ht-expander",
+            onClick: function () { setOpenLog(open ? null : task.id); },
+          }, (open ? "▾ " : "▸ ") + "worker log")
+        ),
+        task.summary ? h("div", { className: "ht-event-summary" }, task.summary) : null,
+        open ? h(TaskLogPane, {
+          key: task.id, task: task,
+          path: base + encodeURIComponent(task.id) + "/log",
+        }) : null
+      );
+    }
+
+    let body;
+    if (!props.rootId) {
+      body = h(Empty, { title: "Nothing on this board yet." },
+        "Send the team its first task below — it lands as a card the dispatcher picks up.");
+    } else if (poll.error && !run) {
+      body = h(ErrorNote, { error: poll.error, what: "This task", onRetry: poll.reload });
+    } else if (!run) {
+      body = h(Loading, { label: "Reading the thread…" });
+    } else {
+      body = events.map(function (event) {
+        if (event.kind === "comment") return renderComment(event);
+        if (event.kind === "root") return renderRoot(event);
+        return renderTask(event);
+      });
+    }
+
+    const root = tasks[0];
+    const done = tasks.filter(function (task) { return task.status === "done"; }).length;
+
+    return h("div", { className: "ht-thread" },
+      root ? h("div", { className: "ht-thread-head" },
+        h("div", { className: "ht-row ht-row-wrap" },
+          h(StatusChip, { status: root.status }),
+          h("strong", null, root.title || root.id),
+          h(Muted, null, done + "/" + tasks.length + " done")
+        ),
+        h(Muted, null, live ? "live · every 1s" : "idle · every 5s")
+      ) : null,
+      poll.error && run
+        ? h(Note, { tone: "warn", title: "Last poll failed" },
+            describeError(poll.error, "This task"))
+        : null,
+      h("div", {
+        className: "ht-thread-scroll",
+        ref: scrollRef,
+        onScroll: function (e) {
+          const el = e.currentTarget;
+          follow.current = el.scrollHeight - el.scrollTop - el.clientHeight < 40;
+        },
+      }, body)
+    );
+  }
+
+  const COMPOSER_MODES = {
+    answer: {
+      label: "Answer", placeholder: "Your decision, in the words the assignee needs…",
+      hint: "The card is parked on you. Approving or rejecting unblocks it.",
+    },
+    steer: {
+      label: "Steer", placeholder: "What the running agent should take into account…",
+      hint: "A comment on the running card. The worker picks it up within ~6s — no unblock.",
+    },
+    task: {
+      label: "New task", placeholder: "What should the team do? (first line is the title)",
+      hint: "First line is the card title; the rest becomes its body.",
+    },
+  };
+
+  function Composer(props) {
+    const team = props.team;
+    // Default assignee = the team's main profile, which is the record's
+    // orchestrator and nothing else — the same fallback post_team_task()
+    // applies. NOT member.primary: managed members are all primary, so it
+    // would pick an arbitrary one. The dropdown is the roster, because a
+    // non-member is refused with E_TEAM_NOT_MEMBER.
+    const mainProfile = team.orchestrator || ((team.members || [])[0] || {}).profile || "";
+    const answerId = props.answerId || null;
+    const steerId = props.steerId || null;
+    const auto = answerId ? "answer" : (steerId ? "steer" : "task");
+
+    const [override, setOverride] = hooks.useState(null);
+    const [text, setText] = hooks.useState("");
+    const [decision, setDecision] = hooks.useState("approve");
+    const [advanced, setAdvanced] = hooks.useState(false);
+    const [assignee, setAssignee] = hooks.useState(mainProfile);
+    const [priority, setPriority] = hooks.useState("0");
+    const [skills, setSkills] = hooks.useState([]);
+    const [skillRows, setSkillRows] = hooks.useState(null);
+    const [skillError, setSkillError] = hooks.useState(null);
+    const [busy, setBusy] = hooks.useState(false);
+    const [error, setError] = hooks.useState(null);
+
+    const mode = (override === "answer" && !answerId) || (override === "steer" && !steerId)
+      ? auto : (override || auto);
+    const spec = COMPOSER_MODES[mode];
+
+    hooks.useEffect(function () { setAssignee(mainProfile); }, [mainProfile]);
+    // A changed situation retires the operator's override: a steer typed for a
+    // card that has since parked must not be sent as one.
+    hooks.useEffect(function () { setOverride(null); setError(null); }, [auto, props.rootId]);
+
+    hooks.useEffect(function () {
+      if (!advanced || !assignee) { return undefined; }
+      let cancelled = false;
+      setSkillRows(null);
+      setSkillError(null);
+      apiGet("/skills?profile=" + encodeURIComponent(assignee)).then(function (data) {
+        if (cancelled) return;
+        setSkillRows((data && data.skills) || []);
+      }, function (err) {
+        if (cancelled) return;
+        setSkillRows([]);
+        setSkillError(describeError(err, "The skill list"));
+      });
+      return function () { cancelled = true; };
+    }, [advanced, assignee]);
+
+    function toggleSkill(name) {
+      setSkills(function (current) {
+        const at = current.indexOf(name);
+        if (at < 0) return current.concat([name]);
+        const next = current.slice();
+        next.splice(at, 1);
+        return next;
+      });
+    }
+
+    function taskPath(taskId) {
+      return "/teams/" + encodeURIComponent(team.slug) + "/tasks/" + encodeURIComponent(taskId);
+    }
+
+    function submit() {
+      const value = text.trim();
+      if (!value || busy || props.readOnly) return;
+      setBusy(true);
+      setError(null);
+      let request;
+      if (mode === "answer") {
+        // confirm == task_id is the same token the DELETEs use (_confirm).
+        const body = { confirm: answerId };
+        body[decision === "reject" ? "reason" : "note"] = value;
+        if (decision === "reject") body.park = false;
+        request = apiSend("POST", taskPath(answerId) + "/" + decision, body);
+      } else if (mode === "steer") {
+        request = apiSend("POST", taskPath(steerId) + "/note", { text: value });
+      } else {
+        // Body keys read by post_team_task(): title, body, assignee, priority,
+        // skills. Board / tenant / workspace come from the record. No
+        // expected_revision: this writes the board DB, not teams.yaml.
+        const lines = value.split("\n");
+        request = apiSend("POST", "/teams/" + encodeURIComponent(team.slug) + "/tasks", {
+          title: lines[0].trim(),
+          body: lines.slice(1).join("\n").trim() || null,
+          assignee: assignee,
+          priority: Number(priority) || 0,
+          skills: skills,
+        });
+      }
+      request.then(function (data) {
+        setBusy(false);
+        setText("");
+        setSkills([]);
+        props.onSent(mode, data || {});
+      }, function (err) {
+        setBusy(false);
+        setError(err);
+        if (isReadOnly(err)) props.onReadOnly();
+      });
+    }
+
+    const items = [];
+    if (answerId) items.push({ value: "answer", label: COMPOSER_MODES.answer.label });
+    if (steerId) items.push({ value: "steer", label: COMPOSER_MODES.steer.label });
+    // Always offered, so steering is never a trap: the operator can queue new
+    // work while the team is busy.
+    items.push({ value: "task", label: COMPOSER_MODES.task.label });
+
+    const sendLabel = mode === "answer"
+      ? (decision === "reject" ? "Request changes" : "Approve")
+      : (mode === "steer" ? "Steer" : "Send");
+
+    return h("div", { className: "ht-composer" },
+      error ? h(ErrorNote, { error: error, what: "This card" }) : null,
+      h("div", { className: "ht-composer-bar" },
+        items.length > 1
+          ? h(PillBar, { value: mode, onChange: setOverride, items: items })
+          : h("span", { className: "ht-kicker" }, spec.label),
+        mode === "answer" ? h(PillBar, {
+          value: decision, onChange: setDecision,
+          items: [{ value: "approve", label: "Approve" },
+                  { value: "reject", label: "Request changes" }],
+        }) : null,
+        mode === "task" ? h("button", {
+          type: "button", className: "ht-expander",
+          onClick: function () { setAdvanced(function (v) { return !v; }); },
+        }, (advanced ? "▾ " : "▸ ") + "assignee, priority, skills") : null,
+        h("span", { className: "ht-composer-hint" }, spec.hint)
+      ),
+      advanced && mode === "task" ? h("div", { className: "ht-composer-advanced" },
+        h("div", { className: "ht-grid-2" },
+          h(Field, { label: "Assignee", htmlFor: "ht-chat-assignee",
+            hint: "Roster only; defaults to the team's main profile." },
+            h(UI.Select, {
+              id: "ht-chat-assignee", value: assignee,
+              disabled: props.readOnly, onValueChange: setAssignee,
+            }, (team.members || []).map(function (m) {
+              return h(UI.SelectOption, { key: m.profile, value: m.profile },
+                m.profile + (m.profile === mainProfile ? " (main)" : "") +
+                " · " + (m.role || "member"));
+            }))
+          ),
+          h(TextField, {
+            id: "ht-chat-priority", label: "Priority", type: "number",
+            value: priority, onChange: setPriority, disabled: props.readOnly,
+            hint: "Higher runs first.",
+          })
+        ),
+        h(Field, { label: "Skills for this card",
+          hint: "Installed skills of " + (assignee || "—") + "." },
+          h(SkillPicker, {
+            skills: skillRows, selected: skills, error: skillError, onToggle: toggleSkill,
+          })
+        )
+      ) : null,
+      h("div", { className: "ht-composer-row" },
+        h("textarea", {
+          className: "ht-composer-input",
+          rows: 3,
+          value: text,
+          placeholder: spec.placeholder,
+          disabled: props.readOnly || busy,
+          onChange: function (e) { setText(e.target.value); },
+          onKeyDown: function (e) {
+            if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); submit(); }
+          },
+        }),
+        h(UI.Button, {
+          disabled: props.readOnly || busy || !text.trim() ||
+            (mode === "task" && !assignee),
+          destructive: mode === "answer" && decision === "reject",
+          onClick: submit,
+        }, busy ? "Sending…" : sendLabel)
+      )
+    );
+  }
+
+  function KanbanBoard(props) {
+    const byLane = {};
+    LANES.forEach(function (lane) { byLane[lane] = []; });
+    (props.tasks || []).forEach(function (task) {
+      if (byLane[task.status]) byLane[task.status].push(task);
+    });
+    return h("div", { className: "ht-board" }, LANES.map(function (lane) {
+      const rows = byLane[lane];
+      return h("div", { key: lane, className: cn("ht-board-col", "ht-lane-" + lane) },
+        h("div", { className: "ht-board-head" },
           h("span", { className: "ht-lane-name" }, lane),
           h("span", { className: "ht-lane-count" }, rows.length)
         ),
-        h("div", { className: "ht-table-wrap" },
-          h("table", { className: "ht-table" },
-            h("thead", null, h("tr", null,
-              h("th", null, "task"),
-              h("th", null, "assignee"),
-              h("th", null, "prio"),
-              h("th", null, "age")
-            )),
-            h("tbody", null, rows.map(function (task) {
-              return h("tr", clickableRow(task.id, false, open(task), "Show the task run of this card"),
-                h(TaskCell, { task: task }),
-                h("td", null, h(AssigneeChip, { assignee: task.assignee })),
-                h("td", null, String(task.priority === undefined ? 0 : task.priority)),
-                h("td", null, ageOf(task.created_at))
-              );
-            }))
-          )
-        )
+        rows.length ? null : h("p", { className: "ht-hint" }, "—"),
+        rows.map(function (task) {
+          const rootId = task.root_id || task.id;
+          const selected = props.rootId === rootId;
+          const row = clickableRow(task.id, selected,
+            function () { props.onOpen(rootId); }, "Open this card's thread");
+          row.className = cn(row.className, "ht-board-card");
+          return h("div", row,
+            h("code", { className: "ht-code" }, String(task.id).slice(0, 8)),
+            h("div", { className: "ht-board-title" }, task.title || ""),
+            h("div", { className: "ht-row ht-row-wrap" },
+              h(AssigneeChip, { assignee: task.assignee }),
+              h(Muted, null, ageOf(task.created_at))
+            )
+          );
+        })
       );
-    }
+    }));
+  }
+
+  function WorkdirTab(props) {
+    const team = props.team;
+    const resolved = team._resolved || {};
+    const counts = props.counts || {};
+    const busyLanes = openLanes(counts);
+    // The backend's own gate is narrower (running cards only, E_TEAM_BUSY).
+    // This one is the operator's: a folder that moves under a queued card is
+    // a card that runs somewhere else than it was written for.
+    const blocked = busyLanes.length > 0;
 
     return h("div", { className: "ht-panel" },
-      h("div", { className: "ht-panel-head" },
-        h("h3", null, "Activity"),
-        h("div", { className: "ht-row" },
-          h(Muted, null, "board "),
+      h("div", { className: "ht-facts" },
+        h("div", null, h("span", { className: "ht-fact-label" }, "board"),
           h(HostLink, { to: "/kanban", rootRef: props.rootRef, title: "Open the Kanban tab" },
-            status.board),
-          h(Muted, null, " · polling every 5s")
-        )
+            team.board),
+          resolved.board_exists === false
+            ? h(UI.Badge, { tone: "warning", className: "ht-inline-badge" }, "missing") : null),
+        h("div", null, h("span", { className: "ht-fact-label" }, "workdir"),
+          h("code", { className: "ht-code" }, team.workdir || "—"),
+          resolved.workdir_exists === false
+            ? h(UI.Badge, { tone: "warning", className: "ht-inline-badge" }, "missing") : null,
+          resolved.workdir_is_git_repo
+            ? h(UI.Badge, { tone: "outline", className: "ht-inline-badge" }, "git") : null)
       ),
-      h(Counters, { counts: status.counts }),
-      status.board_db_path ? null
-        : h(Note, { tone: "info", title: "No board database yet" },
-            "The board is created on the first card — counters read as zero until then."),
-      error ? h(Note, { tone: "warn", title: "Last poll failed" }, error) : null,
-      tasks.length === 0
-        ? h(Empty, { title: "No cards for this team's tenant yet." },
-            "Start work from the Start work panel; the card lands here.")
-        : h("div", { className: "ht-lanes" },
-            [rootsBlock()]
-              .concat(LANES.map(function (lane) { return laneBlock(lane, byLane[lane]); }))
-              .concat([laneBlock("other", other)])
-          )
+      blocked ? h(Note, { tone: "warn", title: "Work is still open" },
+        "Finish or clear " + busyLanes.map(function (lane) {
+          return counts[lane] + " " + lane;
+        }).join(", ") + " first. Every profile of this team moves with the folder, " +
+        "so a card mid-flight would change its ground under it.") : null,
+      h(WorkdirEditor, {
+        team: team, revision: props.revision,
+        readOnly: props.readOnly || blocked,
+        onReadOnly: props.onReadOnly,
+        onChanged: props.onChanged,
+        onClose: props.onClose,
+      })
     );
   }
 
-  function runTime(task) {
-    if (!task.started_at) return h(Muted, null, "queued");
-    if (task.completed_at || task.status === "running") {
-      return durationOf(task.started_at, task.completed_at);
+  function ChatScreen(props) {
+    const slug = props.slug;
+    const [tab, setTab] = hooks.useState("chat");
+    const [team, setTeam] = hooks.useState(null);
+    const [teamError, setTeamError] = hooks.useState(null);
+    const [pinnedRoot, setPinnedRoot] = hooks.useState(null);
+    const [refreshKey, setRefreshKey] = hooks.useState(0);
+
+    hooks.useEffect(function () {
+      setTab("chat");
+      setPinnedRoot(null);
+      setTeam(null);
+    }, [slug]);
+
+    hooks.useEffect(function () {
+      let cancelled = false;
+      setTeamError(null);
+      apiGet("/teams/" + encodeURIComponent(slug)).then(function (data) {
+        if (cancelled) return;
+        setTeam((data && data.team) || null);
+      }, function (err) {
+        if (!cancelled) setTeamError(err);
+      });
+      return function () { cancelled = true; };
+    }, [slug, refreshKey]);
+
+    const statusPoll = usePoll("/teams/" + encodeURIComponent(slug) + "/status", true,
+      [refreshKey], tab === "kanban" ? BOARD_FOCUS_MS : BOARD_POLL_MS);
+    // Which blocked card is parked on a HUMAN: `status` only says "blocked",
+    // and a stuck card is released, not answered (approvals.py refuses the
+    // mix-up). The lane tag is the one place that difference is readable.
+    const approvalsPoll = usePoll(
+      "/teams/" + encodeURIComponent(slug) + "/approvals?kind=needs_input", true,
+      [refreshKey], BUSY_POLL_MS);
+
+    const status = statusPoll.data;
+    const tasks = (status && status.tasks) || [];
+    const roots = (status && status.roots) || [];
+    const byId = {};
+    tasks.forEach(function (task) { byId[task.id] = task; });
+
+    // The thread follows the work unless the operator pinned one: the card
+    // that is running, else the one parked on a human, else the newest start.
+    const RANK = { running: 0, blocked: 1, review: 2, ready: 3, todo: 4 };
+    let liveRoot = null;
+    let liveRank = 99;
+    tasks.forEach(function (task) {
+      const rank = RANK[task.status];
+      if (rank === undefined || rank >= liveRank) return;
+      liveRank = rank;
+      liveRoot = task.root_id || task.id;
+    });
+    const rootId = (pinnedRoot && byId[pinnedRoot] ? pinnedRoot : null) ||
+      liveRoot || (roots[0] || {}).id || null;
+
+    const waiting = ((approvalsPoll.data || {}).approvals || []).filter(function (row) {
+      const task = byId[row.id];
+      return task && (task.root_id || task.id) === rootId;
+    })[0];
+    const running = tasks.filter(function (task) {
+      return task.status === "running" && (task.root_id || task.id) === rootId;
+    })[0];
+
+    function reload() {
+      setRefreshKey(function (n) { return n + 1; });
     }
-    return "—";
-  }
 
-  function lastStarted(tasks) {
-    for (let i = tasks.length - 1; i >= 0; i--) if (tasks[i].started_at) return tasks[i];
-    return tasks[0] || null;
-  }
+    function openThread(id) {
+      setPinnedRoot(id);
+      setTab("chat");
+    }
 
-  function TaskRunView(props) {
-    const base = "/teams/" + encodeURIComponent(props.team.slug) + "/tasks/";
-    const poll = usePoll(base + encodeURIComponent(props.taskId), true);
-    // null follows the running card; a click pins the selection.
-    const [picked, setPicked] = hooks.useState(null);
-    const run = poll.data;
-    const tasks = (run && run.tasks) || [];
-    const current = tasks.filter(function (t) { return t.id === picked; })[0]
-      || tasks.filter(function (t) { return t.status === "running"; })[0]
-      || lastStarted(tasks);
-    const back = h(UI.Button, { size: "sm", outlined: true, onClick: props.onBack }, "← All tasks");
-
-    if (poll.error && !run) {
+    if (teamError) {
       return h("div", { className: "ht-panel" },
-        h("div", { className: "ht-row" }, back),
-        h(ErrorNote, { error: poll.error, what: "This task", onRetry: poll.reload }));
+        h(ErrorNote, { error: teamError, what: "This team", onRetry: reload }));
     }
-    if (!run || !tasks.length) return h(Loading, { label: "Reading the task…" });
+    if (!team) return h(Loading, { label: "Loading team…" });
 
-    const root = tasks[0];
-    const done = tasks.filter(function (t) { return t.status === "done"; }).length;
+    const counts = (status && status.counts) || (team._resolved || {}).counts || {};
+    const openWork = openLanes(counts).reduce(function (n, lane) {
+      return n + Number(counts[lane] || 0);
+    }, 0);
 
-    return h("div", { className: "ht-panel" },
-      h("div", { className: "ht-panel-head" },
-        h("div", { className: "ht-row" }, back, h("h3", null, root.title || root.id)),
-        h("div", { className: "ht-row" },
-          h(StatusChip, { status: root.status }),
-          h(Muted, null, done + "/" + tasks.length + " done · board "),
-          h(HostLink, { to: "/kanban", rootRef: props.rootRef, title: "Open the Kanban tab" },
-            run.board),
-          h(Muted, null, " · polling every 5s")
+    return h("div", { className: "ht-chat-main" },
+      h("div", { className: "ht-chat-head" },
+        h("div", null,
+          h("div", { className: "ht-kicker" }, "team"),
+          h("h2", null, team.display_name || team.slug)
+        ),
+        h("div", { className: "ht-row ht-row-wrap" },
+          tab === "chat" ? h(ThreadPicker, {
+            roots: roots, byId: byId, value: rootId,
+            onChange: function (id) { setPinnedRoot(id); },
+          }) : null,
+          h(PillBar, {
+            value: tab, onChange: setTab,
+            items: [
+              { value: "chat", label: "Chat" },
+              { value: "kanban", label: "Kanban", badge: openWork || null },
+              { value: "workdir", label: "Workdir" },
+            ],
+          })
         )
       ),
-      poll.error
-        ? h(Note, { tone: "warn", title: "Last poll failed" }, describeError(poll.error, "This task"))
+      statusPoll.error && !status
+        ? h(ErrorNote, { error: statusPoll.error, what: "This board", onRetry: reload })
         : null,
-      h("div", { className: "ht-run-split" },
-        h("div", { className: "ht-table-wrap" },
-          h("table", { className: "ht-table" },
-            h("thead", null, h("tr", null,
-              h("th", null, "#"),
-              h("th", null, "card"),
-              h("th", null, "status"),
-              h("th", null, "time")
-            )),
-            h("tbody", null, tasks.map(function (task, i) {
-              return h("tr", clickableRow(task.id, current && current.id === task.id,
-                  function () { setPicked(task.id); }, "Show this card's log"),
-                h("td", null, h(Muted, null, String(i + 1))),
-                h("td", null,
-                  h("code", { className: "ht-code" }, task.id),
-                  h("span", { className: "ht-run-title" }, task.title || ""),
-                  h("div", { className: "ht-run-meta" }, h(AssigneeChip, { assignee: task.assignee }))
-                ),
-                h("td", null, h(StatusChip, { status: task.status })),
-                h("td", null, runTime(task))
-              );
-            }))
-          )
-        ),
-        current ? h(TaskLogPane, {
-          key: current.id, task: current,
-          path: base + encodeURIComponent(current.id) + "/log",
-        }) : null
-      )
+      tab === "chat" ? h(ChatThread, {
+        slug: slug, rootId: rootId, refreshKey: refreshKey,
+      }) : null,
+      tab === "chat" ? h(Composer, {
+        team: team, rootId: rootId,
+        answerId: waiting ? waiting.id : null,
+        steerId: running ? running.id : null,
+        readOnly: props.readOnly, onReadOnly: props.onReadOnly,
+        onSent: function (mode, data) {
+          if (mode === "steer" && data.delivery === "next_run") {
+            props.onToast("Noted. The card is not running — the agent reads it on its next run.");
+          } else if (mode === "steer") {
+            props.onToast("Steered. The running worker picks this up within ~6s.");
+          } else if (mode === "task") {
+            setPinnedRoot(data.task_id || null);
+          }
+          reload();
+        },
+      }) : null,
+      tab === "kanban" ? h(KanbanBoard, {
+        tasks: tasks, rootId: rootId, onOpen: openThread,
+      }) : null,
+      tab === "workdir" ? h(WorkdirTab, {
+        team: team, counts: counts, revision: props.revision,
+        readOnly: props.readOnly, rootRef: props.rootRef,
+        onReadOnly: props.onReadOnly,
+        onChanged: function () { reload(); props.onRegistryChanged(); },
+        onClose: function () { setTab("chat"); },
+      }) : null
     );
   }
 
   function TaskLogPane(props) {
     const task = props.task;
-    const poll = usePoll(props.path, task.status === "running");
+    const poll = usePoll(props.path, task.status === "running", null, LOG_POLL_MS);
     const log = poll.data;
     const preRef = hooks.useRef(null);
     // Follow the tail unless the reader scrolled up.
@@ -2574,8 +2876,6 @@
         onChange: setPanel,
         items: [
           { value: "roster", label: "Roster", badge: (team.members || []).length },
-          { value: "start", label: "Start work" },
-          { value: "activity", label: "Activity" },
           { value: "drift", label: "Drift" },
         ],
       }),
@@ -2583,13 +2883,6 @@
         team: team, resolved: resolved, revision: props.revision,
         readOnly: props.readOnly, rootRef: props.rootRef,
         onReadOnly: props.onReadOnly, onChanged: reload,
-      }) : null,
-      panel === "start" ? h(StartWorkPanel, {
-        team: team, readOnly: props.readOnly, onReadOnly: props.onReadOnly,
-        onCreated: function () { setRefreshKey(function (n) { return n + 1; }); },
-      }) : null,
-      panel === "activity" ? h(ActivityPanel, {
-        team: team, refreshKey: refreshKey, rootRef: props.rootRef,
       }) : null,
       panel === "drift" ? h(DriftPanel, {
         team: team, revision: props.revision, refreshKey: refreshKey,
@@ -3863,14 +4156,74 @@
   // Root
   // ═══════════════════════════════════════════════════════════════════════════
 
-  function TeamsPage() {
+  // ═══════════════════════════════════════════════════════════════════════════
+  // Settings — everything that is not the conversation: the registry, the
+  // roster, drift, and the profiles behind them.
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  function SettingsScreen(props) {
+    const [panel, setPanel] = hooks.useState("teams");
+    const [slug, setSlug] = hooks.useState(null);
+
+    hooks.useEffect(function () { setSlug(null); }, [panel]);
+
+    return h("div", { className: "ht-settings" },
+      h("div", { className: "ht-settings-head" },
+        h(PillBar, {
+          value: panel, onChange: setPanel,
+          items: [
+            { value: "teams", label: "Teams", badge: props.teams ? props.teams.length : null },
+            { value: "profiles", label: "Profiles", badge: props.profileCount },
+          ],
+        }),
+        panel === "teams" ? h(UI.Button, {
+          disabled: props.readOnly, onClick: props.onNewTeam,
+        }, "New team") : null
+      ),
+      props.teamsError && panel === "teams"
+        ? h(ErrorNote, { error: props.teamsError, what: "The registry", onRetry: props.onReload })
+        : null,
+      panel === "teams" && slug ? h("div", { className: "ht-breadcrumb" },
+        h("button", {
+          type: "button", className: "ht-crumb",
+          onClick: function () { setSlug(null); },
+        }, "← all teams"),
+        h("code", { className: "ht-code" }, slug)
+      ) : null,
+      panel === "teams" && !slug ? h(TeamList, {
+        teams: props.teams, refreshKey: props.refreshKey, rootRef: props.rootRef,
+        onOpen: setSlug, revision: props.revision, readOnly: props.readOnly,
+        onReadOnly: props.onReadOnly, onDestroyed: props.onDestroyed,
+      }) : null,
+      panel === "teams" && slug ? h(TeamDetail, {
+        slug: slug, revision: props.revision, readOnly: props.readOnly,
+        rootRef: props.rootRef, onReadOnly: props.onReadOnly,
+        onRegistryChanged: props.onReload,
+        onDestroyed: function (data, destroyed) {
+          setSlug(null);
+          props.onDestroyed(data, destroyed);
+        },
+      }) : null,
+      panel === "profiles" ? h(ProfilesScreen, {
+        readOnly: props.readOnly, onReadOnly: props.onReadOnly,
+        onCount: props.onProfileCount, onToast: props.onToast,
+      }) : null
+    );
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // Root — chat is the product, settings is the drawer.
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  function SynergiaApp() {
     const i18n = useI18n();
     const t = (i18n && i18n.t) || {};
     const rootRef = hooks.useRef(null);
     const toaster = useToast();
 
-    const [screen, setScreen] = hooks.useState({ name: "teams", slug: null });
+    const [screen, setScreen] = hooks.useState("chat");
     const [teams, setTeams] = hooks.useState(null);
+    const [selected, setSelected] = hooks.useState(rememberedTeam());
     const [revision, setRevision] = hooks.useState(null);
     const [teamsError, setTeamsError] = hooks.useState(null);
     const [defaultNaming, setDefaultNaming] = hooks.useState("");
@@ -3893,22 +4246,20 @@
       return function () { cancelled = true; };
     }, [refreshKey]);
 
+    // The rail's own source: slugs, lane counts and the registry revision.
+    // Slow on purpose — the selected team polls its board far harder.
+    const teamsPoll = usePoll("/teams", true, [refreshKey], 10000);
     hooks.useEffect(function () {
-      let cancelled = false;
-      apiGet("/teams").then(function (data) {
-        if (cancelled) return;
-        setTeams((data && data.teams) || []);
-        // CAS gate compares against the REGISTRY revision (_cas_gate reads
-        // storage.load().revision), not a team's own — so this is the value
-        // every expected_revision below must carry.
-        setRevision(data && typeof data.revision === "number" ? data.revision : null);
-        setTeamsError(null);
-      }, function (err) {
-        if (cancelled) return;
-        setTeamsError(err);
-      });
-      return function () { cancelled = true; };
-    }, [refreshKey]);
+      if (teamsPoll.error) { setTeamsError(teamsPoll.error); return; }
+      const data = teamsPoll.data;
+      if (!data) return;
+      setTeams(data.teams || []);
+      // The CAS gate compares against the REGISTRY revision (_cas_gate reads
+      // storage.load().revision), not a team's own — so this is the value
+      // every expected_revision below must carry.
+      setRevision(typeof data.revision === "number" ? data.revision : null);
+      setTeamsError(null);
+    }, [teamsPoll.data, teamsPoll.error]);
 
     // Read-only capability probe (§11 / g7). plugin_api._mutation_guard
     // answers 405 DASHBOARD_READONLY on every non-GET except the dry-run sync
@@ -3930,12 +4281,22 @@
       return function () { cancelled = true; };
     }, []);
 
+    // A remembered team that was destroyed elsewhere must not strand the page.
+    const known = (teams || []).filter(function (row) { return row.slug === selected; })[0];
+    hooks.useEffect(function () {
+      if (!teams || !teams.length) return;
+      if (!known) selectTeam(teams[0].slug);
+    }, [teams, known]);
+
+    function selectTeam(slug) {
+      setSelected(slug);
+      rememberTeam(slug);
+    }
+
     function onReadOnly() {
       setReadOnly(true);
       toaster.showToast("This dashboard is read-only (dashboard_writes: false).", "error");
     }
-
-    function openTeam(slug) { setScreen({ name: "detail", slug: slug }); }
 
     function onTeamDestroyed(data, slug) {
       toaster.showToast(
@@ -3944,65 +4305,56 @@
           ? " (kept adopted: " + data.skipped_purge.join(", ") + ")" : "") +
         (busyOutcome(data) ? ". " + busyOutcome(data).trim() : ""),
         "success");
-      setScreen({ name: "teams", slug: null });
+      if (slug === selected) setSelected(null);
       reloadAll();
     }
 
     return h("div", { className: "ht-page", ref: rootRef },
       h(UI.Toast, { toast: toaster.toast }),
-      h("section", { className: "ht-hero" },
+      h("section", { className: "ht-topbar" },
         h("div", null,
           h("div", { className: "ht-kicker" }, tx(t, "hero.kicker", "Managed agent teams")),
-          h("h1", null, tx(t, "hero.title", "Synergia")),
-          h("p", null, tx(t, "hero.subtitle",
-            "Rosters, boards and folders in one record. Everything here runs the " +
-            "same code the hermes team CLI runs — no second implementation."))
+          h("h1", null, tx(t, "hero.title", "Synergia"))
         ),
         h("div", { className: "ht-row" },
-          h(UI.Button, { outlined: true, onClick: reloadAll }, "Reload"),
-          h(UI.Button, {
-            disabled: readOnly,
-            onClick: function () { setNewTeam(true); },
-          }, "New team")
+          h(PillBar, {
+            value: screen, onChange: setScreen,
+            items: [
+              { value: "chat", label: "Chat" },
+              { value: "settings", label: "Settings" },
+            ],
+          }),
+          h(UI.Button, { size: "sm", outlined: true, onClick: reloadAll }, "Reload")
         )
       ),
       readOnly ? h(Note, { tone: "warn", title: "Read-only dashboard" }, READONLY_MESSAGE) : null,
-      h(PillBar, {
-        value: screen.name === "detail" ? "teams" : screen.name,
-        onChange: function (value) { setScreen({ name: value, slug: null }); },
-        items: [
-          { value: "teams", label: "Teams", badge: teams ? teams.length : null },
-          { value: "profiles", label: "Profiles", badge: profileCount },
-        ],
-      }),
-      screen.name === "detail" ? h("div", { className: "ht-breadcrumb" },
-        h("button", {
-          type: "button", className: "ht-crumb",
-          onClick: function () { setScreen({ name: "teams", slug: null }); },
-        }, "← all teams"),
-        h("code", { className: "ht-code" }, screen.slug)
+      screen === "chat" ? h("div", { className: "ht-chat" },
+        h(TeamRail, {
+          teams: teams || [], selected: selected,
+          onSelect: selectTeam, onReload: reloadAll,
+        }),
+        teamsError && !teams
+          ? h(ErrorNote, { error: teamsError, what: "The registry", onRetry: reloadAll })
+          : null,
+        teams && !teams.length
+          ? h(Empty, { title: "No teams yet." },
+              "Settings → Teams → New team builds the roster, the board and the folder in one go.")
+          : null,
+        teams && teams.length && selected ? h(ChatScreen, {
+          key: selected, slug: selected, revision: revision, readOnly: readOnly,
+          rootRef: rootRef, onReadOnly: onReadOnly, onRegistryChanged: reloadAll,
+          onToast: function (message) { toaster.showToast(message, "success"); },
+        }) : null
       ) : null,
-      teamsError && (screen.name === "teams" || screen.name === "detail")
-        ? h(ErrorNote, { error: teamsError, what: "The registry", onRetry: reloadAll }) : null,
-      screen.name === "teams" ? h(TeamList, {
-        teams: teams, refreshKey: refreshKey, rootRef: rootRef, onOpen: openTeam,
-        revision: revision, readOnly: readOnly, onReadOnly: onReadOnly,
+      screen === "settings" ? h(SettingsScreen, {
+        teams: teams, teamsError: teamsError, refreshKey: refreshKey,
+        revision: revision, readOnly: readOnly, rootRef: rootRef,
+        profileCount: profileCount,
+        onReload: reloadAll, onReadOnly: onReadOnly,
         onDestroyed: onTeamDestroyed,
-      }) : null,
-      screen.name === "profiles" ? h(ProfilesScreen, {
-        readOnly: readOnly,
-        onReadOnly: onReadOnly,
-        onCount: setProfileCount,
+        onProfileCount: setProfileCount,
+        onNewTeam: function () { setNewTeam(true); },
         onToast: function (message) { toaster.showToast(message, "success"); },
-      }) : null,
-      screen.name === "detail" ? h(TeamDetail, {
-        slug: screen.slug,
-        revision: revision,
-        readOnly: readOnly,
-        rootRef: rootRef,
-        onReadOnly: onReadOnly,
-        onRegistryChanged: reloadAll,
-        onDestroyed: onTeamDestroyed,
       }) : null,
       newTeam ? h(NewTeamDialog, {
         teams: teams || [],
@@ -4011,15 +4363,16 @@
         onReadOnly: onReadOnly,
         onClose: function () { setNewTeam(false); reloadAll(); },
         onCreated: function (result) {
-          toaster.showToast(
-            "Team " + (((result || {}).team || {}).slug || "") + " created.", "success");
+          const slug = ((result || {}).team || {}).slug || "";
+          toaster.showToast("Team " + slug + " created.", "success");
+          if (slug) selectTeam(slug);
           reloadAll();
         },
       }) : null
     );
   }
 
-  window.__HERMES_PLUGINS__.register("hermes-agent-synergia", TeamsPage);
+  window.__HERMES_PLUGINS__.register("hermes-agent-synergia", SynergiaApp);
   // Older hosts have no slot registry — the tab still works without the badge.
   if (typeof window.__HERMES_PLUGINS__.registerSlot === "function") {
     window.__HERMES_PLUGINS__.registerSlot("hermes-agent-synergia", "header-right", ApprovalsBadge);

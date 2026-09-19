@@ -679,3 +679,103 @@ def test_cli_show_explains_a_stuck_card_instead_of_dismissing_it(alpha, parser,
     assert "STUCK" in out.err
     assert "not waiting on a human right now" not in out.err
     assert f"hermes team release {tid}" in out.err
+
+
+# ── steering a card that is already moving ───────────────────────────────────
+
+def _force_status(board, tid, status):
+    with _conn(board) as conn:
+        conn.execute("UPDATE tasks SET status = ? WHERE id = ?", (status, tid))
+        conn.commit()
+
+
+def test_note_comments_without_unblocking_or_touching_status(alpha):
+    """A note is a comment and nothing else. The delivery is the substrate's
+    live bridge (``inject_new_comments_from_env`` steers new comments into the
+    running agent), so the card must keep running for it to be heard."""
+    _force_status("alpha", alpha["open"], "running")
+    t = storage.load().teams["alpha"]
+    res = approvals.note(t, alpha["open"], "prefer the streaming parser")
+    assert res["action"] == "note"
+    assert res["unblocked"] is False
+    assert res["delivery"] == "mid-run"
+    assert _status_of("alpha", alpha["open"]) == ("running", None)
+    author, body = _comments_of("alpha", alpha["open"])[-1]
+    assert author.startswith("operator")
+    assert body == "NOTE: prefer the streaming parser"
+
+
+def test_note_on_a_card_that_is_not_running_waits_for_its_next_run(alpha):
+    """A queued card has no worker polling it, so the note is context its next
+    run reads — the operator is told which of the two happened."""
+    assert _status_of("alpha", alpha["open"])[0] == "ready"
+    t = storage.load().teams["alpha"]
+    res = approvals.note(t, alpha["open"], "start from the fixture")
+    assert res["delivery"] == "next_run"
+    assert _status_of("alpha", alpha["open"])[0] == "ready"
+    assert _comments_of("alpha", alpha["open"])[-1][1] == \
+        "NOTE: start from the fixture"
+
+
+def test_note_refuses_a_card_waiting_on_a_human_and_names_approve(alpha):
+    """The refusal exists because the comment WOULD land: the operator would
+    read the thread as answered while the card stayed blocked forever."""
+    t = storage.load().teams["alpha"]
+    with pytest.raises(Exception) as exc:
+        approvals.note(t, alpha["waiting"], "use option A")
+    err = exc.value
+    assert err.code == "E_TEAM_INVALID"
+    assert f"hermes team approve {alpha['waiting']}" in err.remedy
+    assert _comments_of("alpha", alpha["waiting"])[-1][1] != "NOTE: use option A"
+    assert _status_of("alpha", alpha["waiting"]) == ("blocked", "needs_input")
+
+
+def test_note_refuses_a_stuck_card_and_names_release(alpha):
+    tid = _gave_up("alpha", tenant="alpha")
+    t = storage.load().teams["alpha"]
+    with pytest.raises(Exception) as exc:
+        approvals.note(t, tid, "try the wrapper")
+    err = exc.value
+    assert err.code == "E_TEAM_INVALID"
+    assert f"hermes team release {tid}" in err.remedy
+
+
+def test_note_refuses_a_done_card(alpha):
+    _force_status("alpha", alpha["open"], "done")
+    t = storage.load().teams["alpha"]
+    with pytest.raises(Exception) as exc:
+        approvals.note(t, alpha["open"], "one more thing")
+    assert exc.value.code == "E_TEAM_INVALID"
+    assert _comments_of("alpha", alpha["open"]) == []
+
+
+def test_note_refuses_empty_text_and_names_the_text_flag(alpha):
+    t = storage.load().teams["alpha"]
+    with pytest.raises(Exception) as exc:
+        approvals.note(t, alpha["open"], "   ")
+    err = exc.value
+    assert err.code == "E_TEAM_INVALID"
+    assert "--text" in err.remedy
+    assert _comments_of("alpha", alpha["open"]) == []
+
+
+def test_cli_note_finds_the_card_without_a_team(alpha, parser, capsys):
+    _force_status("alpha", alpha["open"], "running")
+    code, env, _out = _run(parser, "note", alpha["open"],
+                           "--text", "prefer the streaming parser",
+                           "--json", capsys=capsys)
+    assert code == 0
+    assert env["ok"] is True
+    assert env["data"]["action"] == "note"
+    assert env["data"]["delivery"] == "mid-run"
+    assert env["data"]["comment_id"]
+    assert _status_of("alpha", alpha["open"]) == ("running", None)
+
+
+def test_cli_note_says_when_the_worker_hears_it(alpha, parser, capsys):
+    _force_status("alpha", alpha["open"], "running")
+    code, _env, out = _run(parser, "note", alpha["open"], "--text", "go wide",
+                           capsys=capsys)
+    assert code == 0
+    assert "~6s" in out.err
+    assert "hermes kanban unblock" not in out.err      # a note never unblocks

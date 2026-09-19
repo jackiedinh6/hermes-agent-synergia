@@ -282,6 +282,17 @@ def _setup_parser_impl(p):
                     help="Disambiguate when two teams hold the same card id")
     sp.add_argument("--json", action="store_true")
 
+    sp = subs.add_parser(
+        "note",
+        help="Steer a card that is already moving: leave a note the running "
+             "worker picks up mid-run (comment only — no unblock)")
+    sp.add_argument("card")
+    sp.add_argument("--text", required=True, metavar="TEXT",
+                    help="What the assignee should take into account right now")
+    sp.add_argument("--team", default=None, metavar="TEAM",
+                    help="Disambiguate when two teams hold the same card id")
+    sp.add_argument("--json", action="store_true")
+
     sp = subs.add_parser("destroy", help="Delete a team and its managed profiles")
     sp.add_argument("team")
     sp.add_argument("--yes", action="store_true")
@@ -3150,14 +3161,24 @@ def _lane_counts(rows: list) -> dict:
 
 
 _DECISION_VERBS = {"approve": "approved", "reject": "changes requested on",
-                   "release": "released"}
+                   "release": "released", "note": "noted on"}
+
+# What a note's operator reads instead of the unblock advice: a note never
+# unblocks, so the only question left is when the agent hears it.
+_NOTE_DELIVERY = {
+    "mid-run": "  the running worker picks it up within ~6s",
+    "next_run": "  the card is not running — delivered when it next runs",
+}
 
 
 def _decision_lines(res: dict) -> list:
     verb = _DECISION_VERBS.get(res["action"], res["action"])
     lines = [f"{verb} {res['task_id']} ({res['team']}): {res['title']}",
              f"  comment #{res['comment_id']} by {res['author']}"]
-    if res["unblocked"]:
+    if res["action"] == "note":
+        lines.append(_NOTE_DELIVERY.get(res.get("delivery"),
+                                        f"  card is {res['status']!r}"))
+    elif res["unblocked"]:
         lines.append(f"  card is now {res['status']!r} — "
                      f"{res['assignee'] or 'its assignee'} resumes it")
     else:
@@ -3196,6 +3217,16 @@ def _cmd_release(args) -> int:
     return 0
 
 
+def _cmd_note(args) -> int:
+    from . import approvals
+    reg = storage.load()
+    t, _d = _find_card(args.card, args.team, reg)
+    res = approvals.note(t, args.card, args.text)
+    res["_human"] = _decision_lines(res)
+    _emit(res, json_mode=args.json)
+    return 0
+
+
 _COMMANDS = {
     "list": _cmd_list,
     "show": _cmd_show,
@@ -3206,6 +3237,7 @@ _COMMANDS = {
     "approve": _cmd_approve,
     "reject": _cmd_reject,
     "release": _cmd_release,
+    "note": _cmd_note,
     "destroy": _cmd_destroy,
     "add-member": _cmd_add_member,
     "remove-member": _cmd_remove_member,

@@ -1,9 +1,9 @@
 {
   "name": "hermes-agent-synergia",
   "label": "Synergia",
-  "description": "Managed agent teams — roster, live task counts, drift, profile catalog and template pickers, all backed by the hermes team CLI's own modules",
+  "description": "Chat with your agent teams — give a task, steer it mid-run, answer what it asks, watch the board, and manage teams and profiles in Settings",
   "icon": "Users",
-  "version": "0.6.0",
+  "version": "0.7.0",
   "tab": {
     "path": "/synergia",
     "position": "after:skills"

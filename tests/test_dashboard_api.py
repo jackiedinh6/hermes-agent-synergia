@@ -1496,3 +1496,70 @@ def test_approval_detail_marks_a_stuck_card(client, waiting):
     assert d["stuck"] is True
     assert d["awaiting_approval"] is False
     assert d["block_reason"] == "protocol violation"
+
+
+# ── steering a running card: POST …/note and the thread's comments ──────────
+
+def _force_status(board, task_id, status):
+    from hermes_cli import kanban_db, kanban_db_connect
+    with kanban_db_connect.connect_closing(
+            db_path=kanban_db.kanban_db_path(board)) as conn:
+        conn.execute("UPDATE tasks SET status = ? WHERE id = ?",
+                     (status, task_id))
+        conn.commit()
+
+
+@pytest.fixture
+def steerable(client, world, profile):
+    """Team ``px`` with one card the dispatcher is already running."""
+    profile("qa")
+    _job_done(client, _create_team(client)["job_id"])
+    tid = client.post(f"{P}/teams/px/tasks",
+                      json={"title": "ship it"}).json()["data"]["task_id"]
+    _force_status("px", tid, "running")
+    return tid
+
+
+def test_note_comments_a_running_card_without_a_confirm_token(client, steerable):
+    """A note only appends a comment — the same shape as creating a card, which
+    takes no token either. ``delivery`` tells the composer whether the worker
+    hears it now (the substrate's ≥6s comment bridge) or at its next run."""
+    r = client.post(f"{P}/teams/px/tasks/{steerable}/note",
+                    json={"text": "prefer the streaming parser"})
+    assert r.status_code == 200, r.text
+    d = r.json()["data"]
+    assert d["action"] == "note" and d["delivery"] == "mid-run"
+    assert d["unblocked"] is False and d["comment_id"]
+    assert _task_row(None, "px", steerable)["status"] == "running"
+
+
+def test_note_without_text_is_400(client, steerable):
+    for body in ({}, {"text": "   "}, {"text": 7}):
+        r = client.post(f"{P}/teams/px/tasks/{steerable}/note", json=body)
+        assert r.status_code == 400, (body, r.text)
+        assert r.json()["error"]["code"] == "E_TEAM_INVALID"
+        assert "--text" in r.json()["error"]["remedy"]
+
+
+def test_note_on_another_tenants_card_is_404(client, steerable):
+    foreign = _card("px", "not ours", tenant="other-team")
+    r = client.post(f"{P}/teams/px/tasks/{foreign}/note", json={"text": "go"})
+    assert r.status_code == 404
+    assert r.json()["error"]["code"] == "E_TEAM_NOT_FOUND"
+
+
+def test_note_is_405_when_the_dashboard_is_read_only(client, world, steerable):
+    _writes_off(world)
+    assert client.post(f"{P}/teams/px/tasks/{steerable}/note",
+                       json={"text": "go"}).status_code == 405
+
+
+def test_task_tree_carries_comments_only_when_asked(client, steerable):
+    client.post(f"{P}/teams/px/tasks/{steerable}/note", json={"text": "go wide"})
+    plain = client.get(f"{P}/teams/px/tasks/{steerable}").json()["data"]
+    assert "comments" not in plain["tasks"][0]
+    with_comments = client.get(
+        f"{P}/teams/px/tasks/{steerable}?comments=true").json()["data"]
+    row = with_comments["tasks"][0]
+    assert [c["body"] for c in row["comments"]] == ["NOTE: go wide"]
+    assert row["comments"][0]["author"].startswith("operator")

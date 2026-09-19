@@ -320,6 +320,45 @@ def test_task_counts_missing_board_is_zeros_and_creates_nothing(hermes_root):
     assert not kb.kanban_db_path("ghost-board").exists()
 
 
+# ── task_comments (the chat thread's history) ───────────────────────────────
+
+def _carded(board, title, comments=()):
+    from hermes_cli import kanban_db as kb
+    with resolve._kanban_conn().connect_closing(board=board) as conn:
+        tid = kb.create_task(conn, title=title, tenant="proj",
+                             initial_status="running")
+        for author, body in comments:
+            kb.add_comment(conn, tid, author, body)
+    return tid
+
+
+def test_task_comments_group_per_card_oldest_first(world):
+    a = _carded("proj-board", "a", [("operator:default", "NOTE: go wide"),
+                                    ("proj-be", "on it")])
+    b = _carded("proj-board", "b")
+    got = resolve.task_comments("proj-board", [a, b, ""])
+    assert set(got) == {a, b}
+    assert got[b] == []
+    assert [c["body"] for c in got[a]] == ["NOTE: go wide", "on it"]
+    assert set(got[a][0]) == {"id", "author", "body", "created_at"}
+    assert got[a][0]["author"] == "operator:default"
+
+
+def test_task_comments_keep_the_newest_within_the_cap(world):
+    tid = _carded("proj-board", "chatty",
+                  [("proj-be", f"c{i}") for i in range(6)])
+    assert [c["body"] for c in resolve.task_comments(
+        "proj-board", [tid], limit=2)[tid]] == ["c4", "c5"]
+    assert len(resolve.task_comments("proj-board", [tid])[tid]) == 6
+
+
+def test_task_comments_missing_board_is_empty_and_creates_nothing(hermes_root):
+    from hermes_cli import kanban_db as kb
+    assert resolve.task_comments("ghost-board", ["t_1"]) == {}
+    assert resolve.task_comments("ghost-board", []) == {}
+    assert not kb.board_dir("ghost-board").exists()
+
+
 # ── project_for ─────────────────────────────────────────────────────────────
 
 def test_project_for_unlinked_is_none(world):
