@@ -284,3 +284,32 @@ def test_status_missing_board_db_reads_zero_never_mints(hermes_root, parser,
     assert all(v == 0 for v in env["data"]["counts"].values())
     assert env["data"]["open_cards"] == []
     assert not kb.kanban_db_path("gamma-board").is_file()   # still absent
+
+
+# ── `parked` rides beside `counts`, never inside it ──────────────────────────
+#
+# Regression for the parked lanes the six §4.3 buckets cannot express: a
+# `review` card counts as `review` whether an agent is about to pick it up or
+# nothing ever will. `counts` answers "where is the work"; `parked` answers
+# "what is waiting on me", and the two must not be merged — `counts` is frozen.
+
+def test_status_reports_parked_lanes_without_touching_counts(alpha, parser,
+                                                             capsys):
+    _seed("alpha", [("t6", "dev", "triage", 0, 120, "alpha")])
+    code, env, err = _run(parser, "status", "alpha", "--json", capsys=capsys)
+    assert code == 0, err
+    data = env["data"]
+    # counts keeps exactly the six §4.3 keys, in order, with no lane added
+    assert list(data["counts"]) == COUNT_KEYS
+    assert data["parked"]["triage"] == 1
+    assert set(data["parked"]) == {"needs_input", "stuck", "review", "triage",
+                                   "guarded"}
+
+
+def test_status_human_names_the_verb_for_a_parked_lane(alpha, parser, capsys):
+    _seed("alpha", [("t6", "dev", "triage", 0, 120, "alpha")])
+    args = parser.parse_args(["status", "alpha"])
+    code = cli.handle(args)
+    out = capsys.readouterr()
+    assert code == 0
+    assert "--kind triage" in out.err

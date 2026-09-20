@@ -228,15 +228,19 @@ def _setup_parser_impl(p):
 
     sp = subs.add_parser(
         "approvals",
-        help="The operator inbox, tenant-scoped: cards parked on a human "
-             "decision (blocked + needs_input) and stuck cards (blocked "
-             "for anything else, e.g. the dispatcher gave up). No <team> "
-             "lists every team's queue")
+        help="The operator inbox, tenant-scoped: every card nothing moves on "
+             "its own — waiting on a human decision, blocked with nobody to "
+             "answer, finished and waiting in review, routed to triage, or "
+             "held back by the dispatcher's respawn guard. No <team> lists "
+             "every team's queue")
     sp.add_argument("team", nargs="?", default=None,
                     help="Restrict the queue to one team (default: all teams)")
     sp.add_argument("--kind", dest="kind", default="all",
-                    choices=["all", "needs_input", "stuck"],
-                    help="Restrict the queue to one lane (default: all)")
+                    choices=["all", "needs_input", "stuck", "review",
+                             "triage", "guarded"],
+                    help="Restrict the queue to one lane (default: all). "
+                         "needs_input and review take approve/reject; stuck, "
+                         "triage and guarded take release")
     sp.add_argument("--show", dest="show", default=None, metavar="CARD",
                     help="Print one card in full: body, comments, attachments")
     sp.add_argument("--artifact", dest="artifact", default=None, metavar="NAME|ID",
@@ -1430,6 +1434,19 @@ def _cmd_doctor(args) -> int:
     return 0
 
 
+# The three lanes nothing in the substrate ever moves on its own. doctor is
+# where an operator looks when "nothing is happening", so each one says what
+# holds the card, not just that it is parked.
+_DOCTOR_LANE_WHY = {
+    "review": "finished and waiting for a human verdict; with "
+              "kanban.review_dispatch off no agent run will ever pick them up",
+    "triage": "routed to triage after repeated blocks for the same cause; "
+              "nothing schedules a triage card",
+    "guarded": "held back by the dispatcher's respawn guard; it will not "
+               "start them again until the cause is cleared",
+}
+
+
 def _doctor_impl(args) -> dict:
     """Registry-wide invariant report (§8.2 data block)."""
     import hermes_constants
@@ -1461,7 +1478,18 @@ def _doctor_impl(args) -> dict:
     from . import approvals
     waiting_total = 0
     stuck_total = 0
+    parked_total = dict.fromkeys(approvals.QUEUE_KINDS, 0)
     for slug, t in sorted(reg.teams.items()):
+        lanes = approvals.lane_counts(t)
+        for name, n in lanes.items():
+            parked_total[name] = parked_total.get(name, 0) + n
+        for name in ("review", "triage", "guarded"):
+            if lanes.get(name):
+                findings.append({
+                    "severity": "warn", "check": f"parked_{name}",
+                    "message": f"team {slug!r} has {lanes[name]} card(s) "
+                               f"{_DOCTOR_LANE_WHY[name]}",
+                    "remedy": f"hermes team approvals {slug} --kind {name}"})
         waiting = approvals.count_pending(t)
         waiting_total += waiting
         if waiting:
@@ -1643,6 +1671,7 @@ def _doctor_impl(args) -> dict:
         "unclaimed_instances": unclaimed,
         "approvals_waiting": waiting_total,
         "stuck_cards": stuck_total,
+        "parked_lanes": parked_total,
         "catalog_sources": catalog_sources,
         "worker_exit_guard": guard,
     }
@@ -1684,6 +1713,11 @@ def _doctor_human(payload: dict) -> list:
     if payload.get("stuck_cards"):
         lines.append(f"stuck: {payload['stuck_cards']} card(s)"
                      "  (hermes team approvals --kind stuck)")
+    for name in ("review", "triage", "guarded"):
+        n = (payload.get("parked_lanes") or {}).get(name)
+        if n:
+            lines.append(f"{name}: {n} card(s) parked"
+                         f"  (hermes team approvals --kind {name})")
     if payload["unclaimed_instances"]:
         lines.append("unclaimed instances: "
                      + ", ".join(i["profile"] for i in payload["unclaimed_instances"]))
@@ -2908,6 +2942,10 @@ def _cmd_status(args) -> int:
     rows = tools._list_team_tasks(t)
     awaiting = [r for r in rows if approvals.is_pending(r)]
     stuck = [r for r in rows if approvals.is_stuck(r)]
+    # Additive, beside the frozen six-bucket `counts` (§4.3) — never inside
+    # it. `counts` answers "where is the work"; `parked` answers "what is
+    # waiting on me", which is the question `counts` cannot express.
+    parked = approvals.lane_counts(t)
     open_rows = [r for r in rows
                  if (not status and r.status in tools._OPEN_STATUSES)
                  or (status and r.status == status)]
@@ -2937,6 +2975,10 @@ def _cmd_status(args) -> int:
     if stuck:
         human.append(f"  stuck: {len(stuck)}  "
                      f"(hermes team release <card> --note \"…\")")
+    for name in ("review", "triage", "guarded"):
+        if parked.get(name):
+            human.append(f"  {name}: {parked[name]}  "
+                         f"(hermes team approvals {t.slug} --kind {name})")
     human.append(f"  {len(open_rows)} {'matching' if status else 'open'} "
                  f"card(s), showing {len(shown)} (limit {limit})")
     awaiting_ids = {r.id for r in awaiting}
@@ -2961,6 +3003,7 @@ def _cmd_status(args) -> int:
         "awaiting_approval_ids": [r.id for r in awaiting],
         "stuck": len(stuck),
         "stuck_ids": [r.id for r in stuck],
+        "parked": parked,
         "total_matching": len(open_rows),
         "status": status,
         "assignee": assignee,
@@ -3003,16 +3046,98 @@ def _find_card(card: str, team, reg):
         remedy="hermes team approvals")
 
 
+# One headline noun and one row marker per lane, in QUEUE_KINDS order.
+_LANE_NOUN = {
+    "needs_input": "awaiting your approval",
+    "stuck": "stuck",
+    "review": "waiting in review",
+    "triage": "in triage",
+    "guarded": "held by the dispatcher",
+}
+_LANE_MARK = {"stuck": "STUCK   ", "review": "REVIEW  ",
+              "triage": "TRIAGE  ", "guarded": "GUARDED "}
+
+# One sentence per lane for ``--show``: why it is parked, and what ends it.
+_LANE_NOTE = {
+    "stuck": "this card is STUCK — blocked with nobody to answer; release "
+             "it to put it back in the pool",
+    "review": "the work is finished and waiting for your verdict; approving "
+              "completes the card and releases anything waiting behind it",
+    "triage": "this card was routed to triage after repeated blocks for the "
+              "same cause; releasing it sends it back to todo",
+    "guarded": "the dispatcher is holding this card back and will not respawn "
+               "it; fix the cause first, then release it",
+}
+
+# ``check_respawn_guard``'s reason codes, said in operator words. The codes
+# themselves are the substrate's; only this gloss is ours.
+_GUARD_GLOSS = {
+    "blocker_auth": "a quota / auth / billing error is still on the card — "
+                    "fix it outside Hermes, then release",
+    "rate_limit_cooldown": "waiting out a provider rate-limit cooldown; this "
+                           "one clears itself",
+    "recent_success": "a run completed recently — release only if it really "
+                      "should run again",
+    "active_pr": "a pull request is open on this card; re-spawning risks a "
+                 "duplicate",
+}
+
+
 def _queue_headline(rows: list) -> str:
-    """``N card(s) awaiting your approval, M stuck`` — whichever halves exist."""
-    waiting = sum(1 for r in rows if r.get("reason_kind") != "stuck")
-    stuck = len(rows) - waiting
-    parts = []
-    if waiting:
-        parts.append(f"{waiting} card(s) awaiting your approval")
-    if stuck:
-        parts.append(f"{stuck} stuck card(s)" if not parts else f"{stuck} stuck")
+    """``N awaiting your approval, M stuck, …`` — whichever lanes exist."""
+    from . import approvals
+    counts: dict = {}
+    for r in rows:
+        counts[r.get("reason_kind")] = counts.get(r.get("reason_kind"), 0) + 1
+    parts = [f"{counts[k]} card(s) {_LANE_NOUN[k]}"
+             for k in approvals.QUEUE_KINDS if counts.get(k)]
     return ", ".join(parts)
+
+
+def _lane_verbs(r: dict) -> list:
+    """The command(s) that move this card, one per line. A lane with no verb
+    printed is how the Release button became a dead end."""
+    tid = r["id"]
+    if r.get("reason_kind") in ("needs_input", "review"):
+        return [f"      approve: hermes team approve {tid} --note \"…\"",
+                f"      reject:  hermes team reject {tid} --reason \"…\""]
+    return [f"      release: hermes team release {tid} --note \"…\""]
+
+
+def _lane_why(r: dict) -> list:
+    """Why this card is parked, in at most a couple of lines."""
+    lane = r.get("reason_kind")
+    lines = []
+    if lane in ("stuck", "guarded"):
+        gloss = _GUARD_GLOSS.get(r.get("guard_reason") or "")
+        if gloss:
+            lines.append(f"      {r['guard_reason']}: {gloss}")
+        why = r.get("failure_error") or r.get("block_reason")
+        if why and not (lane == "guarded" and gloss):
+            lines.append(f"      {str(why).splitlines()[0]}")
+        if lane == "stuck":
+            kind = r.get("block_kind")
+            if kind == "capability":
+                lines.append("      block_kind=capability — the agent could "
+                             "not do it; fix the cause before releasing")
+            elif not kind:
+                lines.append("      the dispatcher gave up; a release is the "
+                             "whole remedy")
+            if r.get("consecutive_failures"):
+                lines.append(f"      {r['consecutive_failures']} consecutive "
+                             "failure(s) before it was blocked")
+        return lines
+    if lane == "review":
+        lines.append("      the work is finished and waiting for your verdict")
+    elif lane == "triage":
+        lines.append(f"      routed to triage after "
+                     f"{r.get('block_recurrences') or 'repeated'} blocks for "
+                     "the same cause")
+    if r.get("headline"):
+        lines.append(f"      {r['headline']}")
+    elif r.get("block_reason"):
+        lines.append(f"      {r['block_reason']}")
+    return lines
 
 
 def _approval_lines(rows: list, now: int, *, with_team: bool) -> list:
@@ -3024,31 +3149,16 @@ def _approval_lines(rows: list, now: int, *, with_team: bool) -> list:
     for r in rows:
         age = _age_h((now - r["age_seconds"]) if r["age_seconds"] is not None else None, now)
         who = f"{r['team']:<12} " if with_team else ""
-        stuck = r.get("reason_kind") == "stuck"
-        mark = "STUCK  " if stuck else ""
+        mark = _LANE_MARK.get(r.get("reason_kind"), "")
         lines.append(f"  {r['id']:<12} {who}{(r['assignee'] or '-'):<24} "
                      f"{age:>4}  {mark}{r['title']}")
-        if stuck:
-            why = r.get("failure_error") or r.get("block_reason")
-            if why:
-                lines.append(f"      {str(why).splitlines()[0]}")
-            if r.get("consecutive_failures"):
-                lines.append(f"      {r['consecutive_failures']} consecutive "
-                             "failure(s) before it was blocked")
-        elif r.get("headline"):
-            lines.append(f"      {r['headline']}")
-        elif r.get("block_reason"):
-            lines.append(f"      {r['block_reason']}")
+        lines.extend(_lane_why(r))
         if r.get("attachments"):
             lines.append("      artifacts: " + ", ".join(
                 f"{a['filename']} [#{a['id']}, {_human_bytes(a['size'])}]"
                 for a in r["attachments"]))
         lines.append(f"      read:    hermes team approvals --show {r['id']}")
-        if stuck:
-            lines.append(f"      release: hermes team release {r['id']} --note \"…\"")
-        else:
-            lines.append(f"      approve: hermes team approve {r['id']} --note \"…\"")
-            lines.append(f"      reject:  hermes team reject {r['id']} --reason \"…\"")
+        lines.extend(_lane_verbs(r))
     return lines
 
 
@@ -3057,15 +3167,26 @@ def _detail_lines(t, d: dict) -> list:
              f"status={d['status']}/{d.get('block_kind') or '-'}",
              f"  {d['title']}",
              f"  assignee: {d.get('assignee') or '-'}"]
-    if d.get("stuck"):
-        lines.append("  NOTE: this card is STUCK — blocked with nobody to "
-                     "answer; release it to put it back in the pool")
+    lane = d.get("reason_kind")
+    if lane in ("stuck", "guarded"):
+        lines.append(f"  NOTE: {_LANE_NOTE[lane]}")
+        if d.get("guard_reason"):
+            gloss = _GUARD_GLOSS.get(d["guard_reason"], "")
+            lines.append(f"  guard: {d['guard_reason']}"
+                         + (f" — {gloss}" if gloss else ""))
         if d.get("failure_error"):
             lines.append(f"  last failure: {d['failure_error']}")
         if d.get("consecutive_failures"):
             lines.append(f"  consecutive failures: {d['consecutive_failures']}")
         lines.append(f"  release: hermes team release {d['id']} --note \"…\"")
-    elif not d.get("awaiting_approval"):
+    elif lane == "triage":
+        lines.append(f"  NOTE: {_LANE_NOTE[lane]}")
+        lines.append(f"  release: hermes team release {d['id']} --note \"…\"")
+    elif lane == "review":
+        lines.append(f"  NOTE: {_LANE_NOTE[lane]}")
+        lines.append(f"  approve: hermes team approve {d['id']} --note \"…\"")
+        lines.append(f"  reject:  hermes team reject {d['id']} --reason \"…\"")
+    elif lane != "needs_input":
         lines.append("  NOTE: this card is not waiting on a human right now")
     if d.get("block_reason"):
         lines.append(f"  blocked because: {d['block_reason']}")
@@ -3139,7 +3260,9 @@ def _cmd_approvals(args) -> int:
         return 0
 
     kind = (getattr(args, "kind", None) or "all").strip()
-    kinds = approvals.QUEUE_KINDS if kind == "all" else (kind,)
+    # ``None`` — not the whole tuple — so the default view honours the
+    # ``parked_lanes`` setting; naming a lane overrides it.
+    kinds = None if kind == "all" else (kind,)
     if args.team:
         t = approvals.team_or_raise(args.team, reg=reg)
         rows = approvals.queue(t, kinds=kinds)
@@ -3155,9 +3278,18 @@ def _cmd_approvals(args) -> int:
 
 
 def _lane_counts(rows: list) -> dict:
-    """``{needs_input: n, stuck: m}`` — what each surface shows as its badge."""
-    stuck = sum(1 for r in rows if r.get("reason_kind") == "stuck")
-    return {"needs_input": len(rows) - stuck, "stuck": stuck}
+    """``{lane: n}`` over every lane — what each surface shows as its badge.
+
+    Every lane is present even at zero, so a consumer can index it without
+    a ``.get`` and a badge never flickers between two key sets.
+    """
+    from . import approvals
+    out = dict.fromkeys(approvals.QUEUE_KINDS, 0)
+    for r in rows:
+        kind = r.get("reason_kind")
+        if kind in out:
+            out[kind] += 1
+    return out
 
 
 _DECISION_VERBS = {"approve": "approved", "reject": "changes requested on",
@@ -3171,6 +3303,24 @@ _NOTE_DELIVERY = {
 }
 
 
+def _transition_line(res: dict) -> str:
+    """What the card did, in the words of the move that did it. Five lanes
+    share three verbs, so the transition — not the verb — names the outcome."""
+    who = res.get("assignee") or "its assignee"
+    move = res.get("transition")
+    if move == "completed":
+        return (f"  card is now {res['status']!r} — anything waiting behind "
+                "it can start")
+    if move == "reopened":
+        return f"  card is back with {who} for another round"
+    if move == "specified":
+        return "  card is back in the pool as 'todo'"
+    if move == "cleared_guard":
+        return (f"  the dispatcher's hold is cleared — card is "
+                f"{res['status']!r} and can be picked up again")
+    return f"  card is now {res['status']!r} — {who} resumes it"
+
+
 def _decision_lines(res: dict) -> list:
     verb = _DECISION_VERBS.get(res["action"], res["action"])
     lines = [f"{verb} {res['task_id']} ({res['team']}): {res['title']}",
@@ -3179,8 +3329,7 @@ def _decision_lines(res: dict) -> list:
         lines.append(_NOTE_DELIVERY.get(res.get("delivery"),
                                         f"  card is {res['status']!r}"))
     elif res["unblocked"]:
-        lines.append(f"  card is now {res['status']!r} — "
-                     f"{res['assignee'] or 'its assignee'} resumes it")
+        lines.append(_transition_line(res))
     else:
         lines.append(f"  card stays {res['status']!r} (parked); unblock it with: "
                      f"hermes kanban unblock {res['task_id']}")
