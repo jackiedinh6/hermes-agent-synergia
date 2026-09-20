@@ -401,7 +401,13 @@ def _create_card(t, *, title: str, body, assignee: str, parents=(),
     Same substrate call the dashboard's card endpoint makes (public
     ``kanban_db.create_task`` under ``kanban_db_connect``); the board is
     created if missing — this is a mutation path, so minting the DB is in
-    scope (unlike the read-only status/catalog surfaces)."""
+    scope (unlike the read-only status/catalog surfaces).
+
+    ``creator_task_id`` is the calling worker's own card, exactly as the
+    substrate's own writers stamp it (``kanban_create``, ``hermes kanban
+    create``). It adds NO dependency edge — it is what puts the new card in
+    the thread of the card that asked for it, so an orchestrator never has to
+    reach for ``kanban_link`` to make the thread read in order."""
     from hermes_cli import kanban_db, kanban_db_connect
     from . import resolve
     if not t.board:
@@ -417,12 +423,20 @@ def _create_card(t, *, title: str, body, assignee: str, parents=(),
     workspace_path = workdir if kind in ("worktree", "dir") else None
     resolve.prepare_worktree_workdir(t)
 
+    own_card = (os.environ.get("HERMES_KANBAN_TASK") or "").strip() or None
+
     def _write():
         if not resolve.board_exists(t.board):
             resolve.ensure_board(t.board, name=board_label(t),
                                  default_workdir=t.workdir or None)
         with kanban_db_connect.connect_closing(
                 db_path=kanban_db.kanban_db_path(t.board)) as conn:
+            # A stale or cross-board HERMES_KANBAN_TASK must not graft this
+            # card onto a foreign thread: stamp it only when the card is
+            # really on this team's board.
+            creator = (own_card if own_card
+                       and kanban_db.get_task(conn, own_card) is not None
+                       else None)
             return kanban_db.create_task(
                 conn, created_by=created_by, board=t.board,
                 title=str(title).strip(), body=body, assignee=assignee,
@@ -430,6 +444,7 @@ def _create_card(t, *, title: str, body, assignee: str, parents=(),
                 workspace_kind=kind, workspace_path=workspace_path,
                 priority=int(priority or 0),
                 parents=tuple(parents or ()),
+                creator_task_id=creator,
                 skills=(list(skills) if skills else None))
 
     return _write()

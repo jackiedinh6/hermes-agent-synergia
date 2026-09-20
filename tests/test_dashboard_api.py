@@ -35,7 +35,11 @@ Coverage (mandated list, §14.7 dashboard section):
 * non-member assignee → §7.3-shaped envelope;
 * adopted member + ``delete_profile`` → profile left on disk, reported;
   managed member + ``delete_profile`` → profile gone;
-* g3: non-JSON content type → 415, no/​bad token → 401, cross-origin → 403.
+* g3: non-JSON content type → 415, no/​bad token → 401, cross-origin → 403;
+* a thread is rooted at its earliest card: a dependency edge added later,
+  pointing from a newer card at the one the operator started, must not
+  re-root the thread (the dashboard renders ``tasks[0]`` as the operator's
+  own prompt).
 """
 
 from __future__ import annotations
@@ -1198,6 +1202,25 @@ def _set_started(board, started):
         conn.commit()
 
 
+def _set_created(board, created):
+    """``created_at`` is whole seconds, so cards made in one test tie; the
+    root is the earliest card, so the test has to say which one that is."""
+    from hermes_cli import kanban_db, kanban_db_connect
+    with kanban_db_connect.connect_closing(
+            db_path=kanban_db.kanban_db_path(board)) as conn:
+        for tid, ts in created.items():
+            conn.execute("update tasks set created_at = ? where id = ?",
+                         (ts, tid))
+        conn.commit()
+
+
+def _link(board, parent, child):
+    from hermes_cli import kanban_db, kanban_db_connect
+    with kanban_db_connect.connect_closing(
+            db_path=kanban_db.kanban_db_path(board)) as conn:
+        assert kanban_db.link_tasks(conn, parent, child)
+
+
 def test_task_run_tree_in_execution_order(client, world, profile):
     profile("qa")
     _job_done(client, _create_team(client)["job_id"])
@@ -1225,6 +1248,32 @@ def test_task_run_tree_in_execution_order(client, world, profile):
     roots = {r["id"]: r for r in st["roots"]}
     assert set(roots) == {root, other_root}
     assert (roots[root]["total"], roots[root]["done"]) == (4, 0)
+
+
+def test_late_parent_link_does_not_re_root_the_thread(client, world, profile):
+    """The operator asks for a webapp; the orchestrator makes a design card
+    afterwards and links it as a PARENT of the operator's still-running card.
+    That edge is a dependency, not ancestry — the thread stays one thread,
+    still rooted at the card the operator started."""
+    profile("qa")
+    _job_done(client, _create_team(client)["job_id"])
+    entry = client.post(f"{P}/teams/px/tasks",
+                        json={"title": "create a webapp"}).json()["data"]["task_id"]
+    design = _card("px", "design the webapp")
+    _set_created("px", {entry: 100, design: 200})
+    _set_started("px", {entry: 150})
+    _link("px", parent=design, child=entry)
+
+    for tid in (entry, design):
+        d = client.get(f"{P}/teams/px/tasks/{tid}").json()["data"]
+        assert d["root_id"] == entry
+        assert [t["id"] for t in d["tasks"]] == [entry, design]
+    assert d["tasks"][0]["parents"] == [design]
+
+    st = client.get(f"{P}/teams/px/status").json()["data"]
+    assert [r["id"] for r in st["roots"]] == [entry]
+    assert {t["id"]: t["root_id"] for t in st["tasks"]} == {entry: entry,
+                                                            design: entry}
 
 
 def test_task_log_reads_the_worker_log(client, world, profile):

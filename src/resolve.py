@@ -543,6 +543,14 @@ def task_forest(board: str, tenant: Optional[str] = None) -> dict:
     its parent. A card with neither is a root. Each group is in execution
     order: root first, then by start time, cards not yet started last.
 
+    One thread per connected component, rooted at its EARLIEST card — by
+    creation, then by start, since ``created_at`` is whole seconds and cards
+    made in one second tie. A dependency edge points at what must finish
+    first, which is not the same as ancestry. A worker that links its own
+    in-flight card under a card created later would otherwise re-root — or,
+    once the creator edge points back, split — the thread the operator
+    started.
+
     Read-only, same gate as :func:`task_counts` — a missing board DB reads
     as ``{}`` and is never minted."""
     db_path = _board_db(board)
@@ -566,18 +574,29 @@ def task_forest(board: str, tenant: Optional[str] = None) -> dict:
     except Exception:  # noqa: BLE001 — an unreadable board reads as no tasks
         return {}
 
-    def root_of(tid: str) -> str:
-        seen = set()
-        while parents[tid] and tid not in seen:
-            seen.add(tid)
-            tid = min(parents[tid], key=lambda p: (by_id[p].created_at, p))
-        return tid
+    component = {tid: tid for tid in by_id}
+
+    def find(tid: str) -> str:
+        root = tid
+        while component[root] != root:
+            root = component[root]
+        while component[tid] != root:
+            component[tid], tid = root, component[tid]
+        return root
+
+    for tid, pids in parents.items():
+        for pid in pids:
+            a, b = find(tid), find(pid)
+            if a != b:
+                component[a] = b
 
     groups: dict = {}
     for tid in by_id:
-        groups.setdefault(root_of(tid), []).append(by_id[tid])
+        groups.setdefault(find(tid), []).append(by_id[tid])
     forest = {}
-    for rid, tasks in groups.items():
+    for tasks in groups.values():
+        rid = min(tasks, key=lambda t: (t.created_at, t.started_at is None,
+                                        t.started_at or 0, t.id)).id
         tasks.sort(key=lambda t: (t.id != rid, t.started_at is None,
                                   t.started_at or t.created_at,
                                   t.created_at, t.id))

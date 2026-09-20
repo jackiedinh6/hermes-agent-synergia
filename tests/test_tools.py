@@ -461,6 +461,59 @@ def test_create_task_happy_path(world, monkeypatch):
     assert _task_row("px", env2["data"]["task_id"]) is not None
 
 
+def _creator_of(board, task_id):
+    import resolve
+    from hermes_cli import kanban_db, kanban_db_connect
+    with kanban_db_connect.connect_closing(
+            db_path=kanban_db.kanban_db_path(board)) as conn:
+        return resolve._creator_task_id(kanban_db.list_events(conn, task_id))
+
+
+def _set_created(board, created):
+    """``created_at`` is whole seconds, so two cards made in one test tie."""
+    from hermes_cli import kanban_db, kanban_db_connect
+    with kanban_db_connect.connect_closing(
+            db_path=kanban_db.kanban_db_path(board)) as conn:
+        for tid, ts in created.items():
+            conn.execute("update tasks set created_at = ? where id = ?",
+                         (ts, tid))
+        conn.commit()
+
+
+def test_create_task_stamps_the_calling_worker_card(world, monkeypatch):
+    """A card a worker creates belongs to that worker's thread, with no
+    ``kanban_link`` and therefore no dependency edge — ``creator_task_id`` is
+    lineage only."""
+    import resolve
+    monkeypatch.setenv("HERMES_PROFILE", "qa")
+    own = _call("team_create_task", {"title": "create a webapp",
+                                     "assignee": "qa"})["data"]["task_id"]
+    monkeypatch.setenv("HERMES_KANBAN_TASK", own)
+    child = _call("team_create_task", {"title": "design the webapp",
+                                       "assignee": "qa-2"})["data"]["task_id"]
+    assert _creator_of("px", child) == own
+    assert _creator_of("px", own) is None
+    assert _task_row("px", child).status == "ready", "creator adds no edge"
+
+    _set_created("px", {own: 100, child: 200})
+    forest = resolve.task_forest("px", "px")
+    assert list(forest) == [own]
+    assert [t.id for t in forest[own]["tasks"]] == [own, child]
+    assert forest[own]["parents"] == {own: [], child: [own]}
+
+
+def test_create_task_ignores_a_creator_card_off_this_board(world, monkeypatch):
+    """A stale or cross-board ``HERMES_KANBAN_TASK`` stamps nothing: grafting
+    the card onto a foreign thread is worse than leaving it a root."""
+    import resolve
+    monkeypatch.setenv("HERMES_PROFILE", "qa")
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_deadbeef")
+    tid = _call("team_create_task", {"title": "t",
+                                     "assignee": "qa-2"})["data"]["task_id"]
+    assert _creator_of("px", tid) is None
+    assert list(resolve.task_forest("px", "px")) == [tid]
+
+
 def test_create_task_worktree_inits_missing_repo(world, wd, monkeypatch):
     from hermes_cli import kanban_db, kanban_db_connect
     monkeypatch.setenv("HERMES_PROFILE", "qa")
