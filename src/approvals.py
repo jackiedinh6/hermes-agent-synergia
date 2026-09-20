@@ -5,28 +5,50 @@ One module, three callers — ``cli.py`` (``hermes team approvals|approve|reject
 ``kanban_task_blocked`` observer). They share this core so the predicate, the
 comment bodies and the refusals cannot drift between surfaces.
 
-The card is the whole state. A card waits on a human exactly when
+The card is the whole state. Five lanes, disjoint by construction, each with
+the one verb that actually moves it:
 
-    ``status == 'blocked'`` AND ``block_kind == 'needs_input'``
+=============== ========================================== ==================
+lane            predicate                                   verb
+=============== ========================================== ==================
+``needs_input`` ``blocked`` AND ``block_kind='needs_input'`` approve / reject
+``stuck``       ``blocked`` AND any other kind               release
+``review``      ``review``                                   approve / reject
+``triage``      ``triage``                                   release
+``guarded``     ``ready``, newest event
+                ``respawn_guarded``                          release
+=============== ========================================== ==================
 
-inside the team's tenant. Both halves are required: ``unblock_task``
-deliberately keeps ``block_kind`` across an unblock (``kanban_db.py``, the
-comment inside :func:`unblock_task`), so the kind alone would also match every
-card that was *already* approved. The ``review`` lane cannot serve as the gate
-— with ``kanban.review_dispatch`` on, the dispatcher hands ``review`` rows to an
-agent reviewer; ``blocked/needs_input`` is the one lane it leaves alone.
+``needs_input`` needs both halves: ``unblock_task`` deliberately keeps
+``block_kind`` across an unblock (``kanban_db.py``, the comment inside
+:func:`unblock_task`), so the kind alone would also match every card that was
+*already* approved.
 
 A card is *stuck* when it is blocked for any other reason: the dispatcher's
 circuit breaker gave up on it (``kanban_db_dispatch._record_failure`` writes
 ``status='blocked'`` with no ``block_kind`` at all and fires no hook), or an
 agent parked it on a ``capability``/``transient`` cause nobody has cleared.
-Nothing in the substrate moves such a card back on its own, so it gets its own
-lane and its own verb — ``release`` — instead of widening the needs_input predicate.
+``block_kind`` rides on every row so the two read apart: ``capability`` is
+"fix the cause outside Hermes first", a missing kind is "just run it again".
 
-Approve, reject and release are all comment + ``unblock_task``. The assignee
-resumes, reads the decision and completes the card itself, which promotes the
-children through the existing parent gate. This module never completes a card
-for the operator.
+The last three lanes are cards the substrate can park with nothing watching
+them. ``review`` starves outright when ``kanban.review_dispatch`` is off — the
+dispatcher then skips the whole lane, so an approved card sits there forever.
+``triage`` is where ``_route_block`` sends a card at ``BLOCK_RECURRENCE_LIMIT``.
+``guarded`` is ``check_respawn_guard`` holding a ready row back over quota,
+auth or a live PR; ``rate_limit_cooldown`` retries forever by design and never
+blocks, so nothing else would ever show it.
+
+Approve, reject and release are comment + one transition, and which transition
+depends on the lane. On a blocked card they are ``unblock_task``, as before.
+On a ``review`` card approve is :func:`complete_task` — the substrate's own
+sanctioned path ("``review`` for human approval") and the only one that works
+with ``review_dispatch`` off — and reject is ``reopen_review_task``. That is
+the one place this module completes a card for the operator, and it is
+deliberate: an operator approving a design HAS made the decision the card was
+waiting for, and leaving it to an agent run costs a spawn that cannot happen.
+Everywhere else the assignee still resumes, reads the decision and completes
+the card itself.
 
 Substrate calls are lazy imports inside functions (spec §5.2), and only public
 symbols are used (§5.2.1) — ``add_comment`` and ``unblock_task`` append their
@@ -37,6 +59,7 @@ from __future__ import annotations
 
 from .errors import (
     TeamError,
+    E_TEAM_BUSY,
     E_TEAM_INVALID,
     E_TEAM_NOT_FOUND,
     E_TEAM_NO_BOARD,
@@ -44,11 +67,37 @@ from .errors import (
 from . import storage
 
 BLOCKED_STATUS = "blocked"
+REVIEW_STATUS = "review"
+TRIAGE_STATUS = "triage"
+READY_STATUS = "ready"
+
 NEEDS_INPUT = "needs_input"
 STUCK = "stuck"
+REVIEW = "review"
+TRIAGE = "triage"
+GUARDED = "guarded"
 
-# Both lanes of the inbox, in the order the operator reads them.
-QUEUE_KINDS = (NEEDS_INPUT, STUCK)
+# Every lane of the inbox, in the order the operator reads them: decisions
+# first, then the three lanes nothing in the substrate moves on its own.
+QUEUE_KINDS = (NEEDS_INPUT, STUCK, REVIEW, TRIAGE, GUARDED)
+
+# The card statuses each lane can live in — which rows a lane has to read.
+LANE_STATUSES = {
+    NEEDS_INPUT: (BLOCKED_STATUS,),
+    STUCK: (BLOCKED_STATUS,),
+    REVIEW: (REVIEW_STATUS,),
+    TRIAGE: (TRIAGE_STATUS,),
+    GUARDED: (READY_STATUS,),
+}
+
+# The dispatcher's respawn guard writes this event and leaves the row where it
+# is, so the newest event is the only evidence the card is being held back.
+#
+# Only the READY lane becomes ``guarded``. A guarded ``review`` row is already
+# waiting on a person, and that decision is the thing that moves it — so it
+# stays in the ``review`` lane and carries ``guard_reason`` as context.
+GUARD_EVENT = "respawn_guarded"
+_GUARDABLE_STATUSES = (READY_STATUS,)
 
 APPROVE_PREFIX = "APPROVED"
 REJECT_PREFIX = "CHANGES REQUESTED"
@@ -122,11 +171,27 @@ def is_stuck(task) -> bool:
             and (getattr(task, "block_kind", None) or "") != NEEDS_INPUT)
 
 
-def kind_of(task):
-    """``needs_input`` / ``stuck`` / None for a card that is not blocked."""
+def kind_of(task, newest_event=None):
+    """The card's lane, or None when it is not parked at all.
+
+    *newest_event* is the kind of the card's newest event of any kind. It is
+    what separates ``guarded`` from ``review``: the guard leaves the row in
+    place, so a later ``claimed``/``spawned`` event is the proof the hold was
+    released. Without it a ready card can never read as guarded, which is the
+    safe direction — the lane simply stays hidden.
+    """
     if is_pending(task):
         return NEEDS_INPUT
-    return STUCK if is_stuck(task) else None
+    if is_stuck(task):
+        return STUCK
+    status = getattr(task, "status", None)
+    if newest_event == GUARD_EVENT and status in _GUARDABLE_STATUSES:
+        return GUARDED
+    if status == REVIEW_STATUS:
+        return REVIEW
+    if status == TRIAGE_STATUS:
+        return TRIAGE
+    return None
 
 
 # ── row rendering ────────────────────────────────────────────────────────────
@@ -147,27 +212,39 @@ def _attachment_view(att) -> dict:
             "previewable": _is_text(att.filename, att.content_type)}
 
 
-_WAIT_EVENTS = ("blocked", "gave_up", "block_loop_detected")
+# The events that park a card, one per lane. Newest wins, so a card that was
+# blocked long ago and is now waiting in review reads its review request.
+_WAIT_EVENTS = ("blocked", "gave_up", "block_loop_detected", GUARD_EVENT,
+                "review_requested")
 
 
-def _wait_event(conn, task_id) -> tuple:
-    """``(reason, blocked_at)`` off the newest event that parked the card, else
-    ``(None, None)``. ``blocked`` carries ``reason``; the dispatcher's
-    ``gave_up`` carries ``error`` instead, which is the only text a stuck card
-    has to explain itself."""
+def _park_facts(conn, task_id) -> tuple:
+    """``(reason, parked_at, newest_event)``.
+
+    One events read serving both questions the row needs. The first two come
+    off the newest event in :data:`_WAIT_EVENTS`: ``blocked`` carries
+    ``reason``; the dispatcher's ``gave_up`` carries ``error`` instead, which
+    is the only text a stuck card has to explain itself; ``respawn_guarded``
+    carries the guard reason. The third is the newest event of ANY kind, which
+    is what :func:`kind_of` needs to tell a held card from a moving one.
+    """
     from hermes_cli import kanban_db
-    for ev in reversed(kanban_db.list_events(conn, task_id)):
+    events = kanban_db.list_events(conn, task_id)
+    newest_event = events[-1].kind if events else None
+    for ev in reversed(events):
         if ev.kind in _WAIT_EVENTS:
             payload = ev.payload if isinstance(ev.payload, dict) else {}
-            return (payload.get("reason") or payload.get("error"), ev.created_at)
-    return (None, None)
+            return (payload.get("reason") or payload.get("error"),
+                    ev.created_at, newest_event)
+    return (None, None, newest_event)
 
 
-def _row(t, conn, task, *, now: int) -> dict:
+def _row(t, conn, task, *, now: int, facts=None) -> dict:
     from hermes_cli import kanban_db
-    reason, blocked_at = _wait_event(conn, task.id)
+    reason, blocked_at, newest_event = (
+        facts if facts is not None else _park_facts(conn, task.id))
     waiting_since = blocked_at or task.created_at
-    kind = kind_of(task)
+    kind = kind_of(task, newest_event)
     row = {
         "id": task.id,
         "team": t.slug,
@@ -184,37 +261,57 @@ def _row(t, conn, task, *, now: int) -> dict:
         "attachments": [_attachment_view(a)
                         for a in kanban_db.list_attachments(conn, task.id)],
         "reason_kind": kind,
+        "status": task.status,
+        # ``capability`` means "fix the cause outside Hermes first"; a missing
+        # kind means the dispatcher gave up and a retry is the whole remedy.
+        # The UI cannot tell them apart without it, so every row carries it.
+        "block_kind": task.block_kind,
     }
-    if kind == STUCK:
+    if kind in (STUCK, GUARDED):
         # What the dispatcher last saw: the failure text and how many runs it
-        # cost. Only a stuck row has them, so the needs_input payload is
+        # cost. Only these rows have them, so the needs_input payload is
         # unchanged.
         row["failure_error"] = getattr(task, "last_failure_error", None)
         row["consecutive_failures"] = int(
             getattr(task, "consecutive_failures", 0) or 0)
+    if newest_event == GUARD_EVENT:
+        # ``blocker_auth`` / ``rate_limit_cooldown`` / ``recent_success`` /
+        # ``active_pr`` — ``check_respawn_guard``'s own vocabulary, passed
+        # through unchanged so the row and ``hermes kanban tail`` agree. Set on
+        # a review row too: the guard is context there, not the lane.
+        row["guard_reason"] = reason
     return row
 
 
 # ── reads ────────────────────────────────────────────────────────────────────
 
 def _queue_rows(t, kinds) -> list[dict]:
-    """The blocked cards of *t* in the requested lanes, newest wait first. One
-    DB pass whichever lanes are asked for — both predicates read the row that
-    the one ``status=blocked`` query already returned."""
+    """The parked cards of *t* in the requested lanes, newest wait first.
+
+    One ``list_tasks`` query per card status the requested lanes can live in
+    — at most three, and only one when the caller asks for a single lane. The
+    lane itself is then decided per row, so the statuses two lanes share
+    (``blocked`` for needs_input/stuck, ``review`` for review/guarded) are
+    still read once.
+    """
     import time
     from hermes_cli import kanban_db
+    want = frozenset(k for k in kinds if k in QUEUE_KINDS)
+    if not want:
+        return []
     ctx = _conn_ctx(t)
     if ctx is None:
         return []
-    want_input, want_stuck = NEEDS_INPUT in kinds, STUCK in kinds
+    statuses = sorted({st for k in want for st in LANE_STATUSES[k]})
     now = int(time.time())
+    rows: list[dict] = []
     with ctx as conn:
-        tasks = [task for task
-                 in kanban_db.list_tasks(conn, tenant=tenant_of(t),
-                                         status=BLOCKED_STATUS)
-                 if (want_input and is_pending(task))
-                 or (want_stuck and is_stuck(task))]
-        rows = [_row(t, conn, task, now=now) for task in tasks]
+        for status in statuses:
+            for task in kanban_db.list_tasks(conn, tenant=tenant_of(t),
+                                             status=status):
+                facts = _park_facts(conn, task.id)
+                if kind_of(task, facts[2]) in want:
+                    rows.append(_row(t, conn, task, now=now, facts=facts))
     rows.sort(key=lambda r: (-(r["blocked_at"] or r["created_at"] or 0), r["id"]))
     return rows
 
@@ -245,9 +342,52 @@ def stuck(t) -> list[dict]:
     return _queue_rows(t, (STUCK,))
 
 
-def queue(t, *, kinds=QUEUE_KINDS) -> list[dict]:
-    """Both lanes merged — what the operator's inbox shows."""
-    return _queue_rows(t, tuple(kinds))
+def lane(t, kind) -> list[dict]:
+    """Every card of *t* in one lane — the generic form of :func:`pending` and
+    :func:`stuck`, so a caller never re-derives a lane predicate."""
+    return _queue_rows(t, (kind,))
+
+
+def lane_counts(t) -> dict:
+    """``{lane: n}`` over every lane, zeros included, fail-soft.
+
+    The one seam the CLI, ``doctor`` and the dashboard count through, so
+    "nothing is happening" reads the same number everywhere. An unreadable
+    board counts as empty rather than raising — the same rule
+    :func:`count_pending` follows.
+    """
+    out = dict.fromkeys(QUEUE_KINDS, 0)
+    try:
+        rows = _queue_rows(t, default_kinds())
+    except (TeamError, OSError):
+        return out
+    for r in rows:
+        if r["reason_kind"] in out:
+            out[r["reason_kind"]] += 1
+    return out
+
+
+LEGACY_KINDS = (NEEDS_INPUT, STUCK)
+
+
+def default_kinds() -> tuple:
+    """The lanes the inbox shows when the caller asks for all of them.
+
+    ``plugins.entries.hermes-agent-synergia.settings.parked_lanes`` (true by
+    default) is the off switch for the three lanes that read cards the
+    substrate parked without asking anyone: false restores the two blocked
+    lanes and nothing else.
+    """
+    from . import cli
+    value = cli._settings().get("parked_lanes", True)
+    if isinstance(value, str):
+        value = value.strip().lower() not in ("false", "off", "0", "no", "")
+    return QUEUE_KINDS if value else LEGACY_KINDS
+
+
+def queue(t, *, kinds=None) -> list[dict]:
+    """Every lane merged — what the operator's inbox shows."""
+    return _queue_rows(t, tuple(default_kinds() if kinds is None else kinds))
 
 
 def pending_all(reg=None) -> list[dict]:
@@ -255,9 +395,10 @@ def pending_all(reg=None) -> list[dict]:
     return _all_rows(storage.load() if reg is None else reg, (NEEDS_INPUT,))
 
 
-def queue_all(reg=None, *, kinds=QUEUE_KINDS) -> list[dict]:
+def queue_all(reg=None, *, kinds=None) -> list[dict]:
     """:func:`queue` across the registry."""
-    return _all_rows(storage.load() if reg is None else reg, tuple(kinds))
+    return _all_rows(storage.load() if reg is None else reg,
+                     tuple(default_kinds() if kinds is None else kinds))
 
 
 def count_pending(t) -> int:
@@ -305,8 +446,6 @@ def detail(t, task_id: str) -> dict:
         task = _task_or_raise(conn, t, task_id)
         row = _row(t, conn, task, now=now)
         row["body"] = task.body
-        row["status"] = task.status
-        row["block_kind"] = task.block_kind
         row["awaiting_approval"] = is_pending(task)
         row["stuck"] = is_stuck(task)
         row["comments"] = [
@@ -430,70 +569,108 @@ def _stuck_cause(task) -> str:
     return getattr(task, "block_kind", None) or "the dispatcher gave up"
 
 
-def _require_pending(t, task) -> None:
-    if is_pending(task):
-        return
-    if is_stuck(task):
-        raise TeamError(
+# The verb that moves each lane, and why. A refusal quotes both, because a
+# refusal that only says "no" leaves the operator where the Release button did:
+# looking at a card nothing will ever pick up.
+LANE_VERB = {
+    NEEDS_INPUT: "approve",
+    REVIEW: "approve",
+    STUCK: "release",
+    TRIAGE: "release",
+    GUARDED: "release",
+}
+
+LANE_HINT = {
+    NEEDS_INPUT: "The agent asked a person and is waiting on the answer. "
+                 "Approve or request changes so the decision reaches it as a "
+                 "comment.",
+    REVIEW: "The work is finished and waiting for a human verdict. Approving "
+            "completes the card and promotes its children; requesting changes "
+            "sends it back to the implementer.",
+    STUCK: "Nothing in the substrate moves a blocked card on its own. "
+           "Releasing it returns it to the pool with a fresh retry budget.",
+    TRIAGE: "Repeated blocks for the same cause routed this card to triage. "
+            "Releasing it specifies it back into the queue.",
+    GUARDED: "The dispatcher is refusing to respawn this card. Fix the cause "
+             "outside Hermes first — releasing it clears the stale failure "
+             "the guard reads.",
+}
+
+
+def _lane_phrase(task, lane, reason=None) -> str:
+    """How a refusal names the card's current lane."""
+    if lane == NEEDS_INPUT:
+        return "waiting on a human decision"
+    if lane == REVIEW:
+        return "waiting in review for a human decision"
+    if lane == STUCK:
+        return f"stuck ({_stuck_cause(task)})"
+    if lane == TRIAGE:
+        return "in triage after repeated blocks"
+    if lane == GUARDED:
+        return f"held back by the dispatcher ({reason or 'respawn guard'})"
+    return (f"{task.status!r}"
+            + (f"/{task.block_kind!r}" if task.block_kind else ""))
+
+
+def _wrong_lane(t, task, lane, reason, *, action: str, kind=None) -> TeamError:
+    """A refusal naming the verb that DOES move this card.
+
+    *kind* is the lane this verb serves, so a card in no lane at all still
+    sends the operator somewhere useful — the queue of the cards the verb
+    would work on — instead of the whole inbox.
+    """
+    verb = LANE_VERB.get(lane)
+    if verb:
+        return TeamError(
             E_TEAM_INVALID,
-            f"card {task.id} is stuck ({_stuck_cause(task)}), "
-            "not waiting on a human",
-            hint="A stuck card has no decision to approve — releasing it "
-                 "returns it to the pool for another run.",
-            remedy=f'hermes team release {task.id} --note "…"',
+            f"card {task.id} is {_lane_phrase(task, lane, reason)} — "
+            f"{action} does not move it",
+            hint=LANE_HINT[lane],
+            remedy=f'hermes team {verb} {task.id} --note "…"',
         )
-    raise TeamError(
+    return TeamError(
         E_TEAM_INVALID,
-        f"card {task.id} is {task.status!r}"
-        + (f"/{task.block_kind!r}" if task.block_kind else "")
-        + ", not waiting on a human",
-        hint=f"Only cards with status={BLOCKED_STATUS!r} and "
-             f"block_kind={NEEDS_INPUT!r} can be approved or rejected.",
-        remedy=f"hermes team approvals {t.slug}",
+        f"card {task.id} is {_lane_phrase(task, lane, reason)} — "
+        f"nothing is parked for {action}",
+        hint="Only a parked card carries a decision: " + ", ".join(QUEUE_KINDS)
+             + ".",
+        remedy=f"hermes team approvals {t.slug}"
+               + (f" --kind {kind}" if kind else ""),
     )
 
 
-def _require_stuck(t, task) -> None:
-    if is_stuck(task):
-        return
-    if is_pending(task):
-        raise TeamError(
-            E_TEAM_INVALID,
-            f"card {task.id} is waiting on a human decision, not stuck",
-            hint="A card parked on a person is approved or rejected, so the "
-                 "decision reaches the agent as a comment.",
-            remedy=f'hermes team approve {task.id} --note "…"',
-        )
-    raise TeamError(
-        E_TEAM_INVALID,
-        f"card {task.id} is {task.status!r}, not blocked",
-        hint=f"Only a card with status={BLOCKED_STATUS!r} can be released.",
-        remedy=f"hermes team approvals {t.slug} --kind stuck",
-    )
+_DECIDE_LANES = (NEEDS_INPUT, REVIEW)
+_RELEASE_LANES = (STUCK, TRIAGE, GUARDED)
 
 
-def _require_open(t, task) -> None:
+def _require_lane(allowed, action: str):
+    """A ``require`` for :func:`_decide` that admits exactly *allowed*."""
+    def require(t, task, lane, reason) -> None:
+        if lane not in allowed:
+            raise _wrong_lane(t, task, lane, reason, action=action,
+                              kind=allowed[0])
+    return require
+
+
+_require_pending = _require_lane(_DECIDE_LANES, "approve")
+_require_stuck = _require_lane(_RELEASE_LANES, "release")
+
+
+def _require_open(t, task, lane, reason) -> None:
     """A card a note can still reach: not finished, not parked on a decision.
 
-    A blocked card is refused on purpose. The comment would land, the card
-    would stay blocked, and the operator would read the thread as answered —
-    so each blocked lane is pointed at the verb that actually moves it.
+    A parked card is refused on purpose. The comment would land, the card
+    would stay parked, and the operator would read the thread as answered —
+    so each lane is pointed at the verb that actually moves it.
     """
-    if is_pending(task):
+    if lane is not None:
         raise TeamError(
             E_TEAM_INVALID,
-            f"card {task.id} is waiting on a human decision, not running",
-            hint="A note leaves the card blocked. Approving or rejecting is "
-                 "what returns it to the pool with your text attached.",
-            remedy=f'hermes team approve {task.id} --note "…"',
-        )
-    if is_stuck(task):
-        raise TeamError(
-            E_TEAM_INVALID,
-            f"card {task.id} is stuck ({_stuck_cause(task)}), not running",
-            hint="A note leaves the card blocked. Releasing it returns it to "
-                 "the pool for another run with your text attached.",
-            remedy=f'hermes team release {task.id} --note "…"',
+            f"card {task.id} is {_lane_phrase(task, lane, reason)}, "
+            "not running",
+            hint="A note leaves the card where it is. " + LANE_HINT[lane],
+            remedy=f'hermes team {LANE_VERB[lane]} {task.id} --note "…"',
         )
     if task.status == DONE_STATUS:
         raise TeamError(
@@ -528,8 +705,98 @@ def _require_text(action: str, task_id: str, text) -> str:
     return text
 
 
-def _decide(t, task_id: str, *, body: str, author, unblock: bool,
-            action: str, require=_require_pending) -> dict:
+# ── lane transitions ─────────────────────────────────────────────────────────
+# One callable per (verb, lane) pair, each a single public substrate call.
+# They return the transition's name for the envelope, or None when the card
+# moved out from under the decision between the read and the write.
+
+def _move_unblock(conn, t, task, text):
+    """The blocked lanes: ``unblock_task`` resets ``consecutive_failures`` and
+    ``last_failure_error``, so the card gets its full retry budget back
+    instead of one run before the circuit breaker trips."""
+    from hermes_cli import kanban_db
+    return "unblocked" if kanban_db.unblock_task(conn, task.id) else None
+
+
+def _move_complete(conn, t, task, text):
+    """The ``review`` lane's approve: ``review -> done``.
+
+    ``complete_task``'s own docstring names this path ("``review`` for human
+    approval"). It is also the only one that works with
+    ``kanban.review_dispatch`` off, where nothing ever claims a review row —
+    an unblock would put the card straight back into a lane no dispatcher
+    reads. Completing promotes the children through the existing parent gate.
+    """
+    from hermes_cli import kanban_db
+    run_id = getattr(task, "current_run_id", None)
+    try:
+        done = kanban_db.complete_task(
+            conn, task.id, result=text,
+            expected_run_id=int(run_id) if run_id else None)
+    except kanban_db.LiveClaimError as exc:
+        raise TeamError(
+            E_TEAM_BUSY,
+            f"card {task.id} is under a live claim: {exc}",
+            hint="A card a worker still holds is completed by that worker, or "
+                 "after the claim is reclaimed. Nothing is lost by waiting.",
+            remedy=f"hermes team approvals {t.slug} --kind review",
+        ) from exc
+    if not done:
+        raise TeamError(
+            E_TEAM_INVALID,
+            f"card {task.id} cannot complete yet — a parent card is not done",
+            hint="complete_task re-gates on parents inside its own "
+                 "transaction, so the card stays in review until every parent "
+                 "is done. Your comment is already on the card.",
+            remedy=f"hermes team status {t.slug}",
+        )
+    return "completed"
+
+
+def _move_reopen(conn, t, task, text):
+    """The ``review`` lane's request-changes: back to the implementer named in
+    the ``review_requested`` event."""
+    from hermes_cli import kanban_db
+    return "reopened" if kanban_db.reopen_review_task(conn, task.id) else None
+
+
+def _move_specify(conn, t, task, text):
+    """The ``triage`` lane: ``triage -> todo``, where parent gating still
+    applies. ``author=None`` keeps it to one comment — the decision comment is
+    already written."""
+    from hermes_cli import kanban_db
+    return ("specified"
+            if kanban_db.specify_triage_task(conn, task.id, author=None)
+            else None)
+
+
+def _move_clear_guard(conn, t, task, text):
+    """The ``guarded`` lane: clear the stale failure the respawn guard reads.
+
+    The card is ``ready``, not blocked, so ``unblock_task`` cannot reach it —
+    and ``last_failure_error``, which ``blocker_auth`` matches against, is
+    exactly what traps it. ``block_task`` followed by ``unblock_task`` is the
+    only public pair that clears that column.
+
+    ``block_task`` counts a recurrence, so a card released twice for the same
+    cause routes itself to ``triage`` at ``BLOCK_RECURRENCE_LIMIT``. That is
+    deliberate and now legible: ``triage`` is a lane the operator can see.
+    """
+    from hermes_cli import kanban_db
+    if not kanban_db.block_task(conn, task.id, kind="transient",
+                                reason=f"operator release: {text}"):
+        return None
+    return "cleared_guard" if kanban_db.unblock_task(conn, task.id) else "blocked"
+
+
+_APPROVE_MOVES = {NEEDS_INPUT: _move_unblock, REVIEW: _move_complete}
+_REJECT_MOVES = {NEEDS_INPUT: _move_unblock, REVIEW: _move_reopen}
+_RELEASE_MOVES = {STUCK: _move_unblock, TRIAGE: _move_specify,
+                  GUARDED: _move_clear_guard}
+
+
+def _decide(t, task_id: str, *, body: str, text: str, author, action: str,
+            require, moves=None) -> dict:
     from hermes_cli import kanban_db
     ctx = _conn_ctx(t)
     if ctx is None:
@@ -540,18 +807,25 @@ def _decide(t, task_id: str, *, body: str, author, unblock: bool,
     author = (author or "").strip() or operator_author()
     with ctx as conn:
         task = _task_or_raise(conn, t, task_id)
-        require(t, task)
+        reason, _parked_at, newest_event = _park_facts(conn, task.id)
+        lane = kind_of(task, newest_event)
+        require(t, task, lane, reason)
         comment_id = kanban_db.add_comment(conn, task_id, author, body)
-        unblocked = kanban_db.unblock_task(conn, task_id) if unblock else False
+        move = (moves or {}).get(lane)
+        transition = move(conn, t, task, text) if move else None
         after = kanban_db.get_task(conn, task_id)
     return {
         "team": t.slug,
         "board": t.board,
         "task_id": task_id,
         "action": action,
+        "lane": lane,
         "author": author,
         "comment_id": comment_id,
-        "unblocked": bool(unblocked),
+        "transition": transition,
+        # Kept as the envelope's "did the card move" flag across every lane;
+        # ``transition`` says which move it was.
+        "unblocked": transition is not None,
         "status": getattr(after, "status", task.status),
         "assignee": getattr(after, "assignee", task.assignee),
         "title": task.title,
@@ -559,35 +833,41 @@ def _decide(t, task_id: str, *, body: str, author, unblock: bool,
 
 
 def approve(t, task_id: str, note: str, *, author=None) -> dict:
-    """Record the decision and return the card to the pool. Never completes it —
-    the assignee resumes, acts on the note and completes the card itself, which
-    is what promotes the children."""
+    """Record the decision and move the card on.
+
+    ``needs_input`` returns to the pool — the assignee resumes, acts on the
+    note and completes the card itself. ``review`` is completed here: the
+    operator has already made the decision the card was waiting for, and with
+    ``review_dispatch`` off no agent run can ever make it again.
+    """
     note = _require_text("approve", task_id, note)
-    return _decide(t, task_id, body=f"{APPROVE_PREFIX}: {note}",
-                   author=author, unblock=True, action="approve")
+    return _decide(t, task_id, body=f"{APPROVE_PREFIX}: {note}", text=note,
+                   author=author, action="approve",
+                   require=_require_pending, moves=_APPROVE_MOVES)
 
 
 def reject(t, task_id: str, reason: str, *, author=None, park: bool = False) -> dict:
-    """Record requested changes. Unblocks by default (the agent must rework);
-    ``park=True`` records the comment and leaves the card blocked."""
+    """Record requested changes. ``needs_input`` unblocks, ``review`` reopens
+    to the implementer; ``park=True`` records the comment and moves nothing."""
     reason = _require_text("reject", task_id, reason)
-    return _decide(t, task_id, body=f"{REJECT_PREFIX}: {reason}",
-                   author=author, unblock=not park, action="reject")
+    return _decide(t, task_id, body=f"{REJECT_PREFIX}: {reason}", text=reason,
+                   author=author, action="reject",
+                   require=_require_pending,
+                   moves=None if park else _REJECT_MOVES)
 
 
 def release(t, task_id: str, note: str, *, author=None) -> dict:
-    """Return a stuck card to the pool with the operator's note attached.
+    """Return a parked card to the pool with the operator's note attached.
 
-    Same shape as :func:`approve` and, deliberately, no more power: comment +
-    ``unblock_task``. The unblock is what makes it useful — it resets
-    ``consecutive_failures`` and ``last_failure_error`` (``kanban_db.py``), so
-    the card gets the full retry budget again instead of one run before the
-    circuit breaker trips. The operator still never completes it.
+    One verb over the three lanes no human decision is owed on: ``stuck``
+    unblocks, ``triage`` specifies back to ``todo``, ``guarded`` clears the
+    stale failure the dispatcher's respawn guard reads. The operator never
+    completes the card here — release says "try again", not "this is done".
     """
     note = _require_text("release", task_id, note)
-    return _decide(t, task_id, body=f"{RELEASE_PREFIX}: {note}",
-                   author=author, unblock=True, action="release",
-                   require=_require_stuck)
+    return _decide(t, task_id, body=f"{RELEASE_PREFIX}: {note}", text=note,
+                   author=author, action="release",
+                   require=_require_stuck, moves=_RELEASE_MOVES)
 
 
 def note(t, task_id: str, text: str, *, author=None) -> dict:
@@ -605,9 +885,8 @@ def note(t, task_id: str, text: str, *, author=None) -> dict:
     know whether the agent hears this now or at the next run.
     """
     text = _require_text("note", task_id, text)
-    res = _decide(t, task_id, body=f"{NOTE_PREFIX}: {text}",
-                  author=author, unblock=False, action="note",
-                  require=_require_open)
+    res = _decide(t, task_id, body=f"{NOTE_PREFIX}: {text}", text=text,
+                  author=author, action="note", require=_require_open)
     res["delivery"] = ("mid-run" if res["status"] == RUNNING_STATUS
                        else "next_run")
     return res
@@ -756,3 +1035,88 @@ def on_auto_blocked(task_ids, board: str, reg=None) -> dict:
             platforms.update(done)
     result["platforms"] = sorted(platforms)
     return result
+
+
+# ── the review-round loop guard ──────────────────────────────────────────────
+
+REVIEW_ROUND_EVENT = "review_requested"
+REVIEW_ROUND_LIMIT_DEFAULT = 3
+
+
+def review_round_limit() -> int:
+    """``plugins.entries.hermes-agent-synergia.settings.review_round_limit``
+    (3 by default, ``0`` disables the guard)."""
+    from . import cli
+    try:
+        return max(0, int(cli._settings().get("review_round_limit",
+                                              REVIEW_ROUND_LIMIT_DEFAULT)))
+    except (TypeError, ValueError):
+        return REVIEW_ROUND_LIMIT_DEFAULT
+
+
+def review_rounds(conn, task_id: str) -> int:
+    """How many times this card has been handed to a reviewer."""
+    from hermes_cli import kanban_db
+    return sum(1 for ev in kanban_db.list_events(conn, task_id)
+               if ev.kind == REVIEW_ROUND_EVENT)
+
+
+def check_review_loop(task_ids, board: str, *, limit=None) -> dict:
+    """Park the cards that have gone round the review loop too many times.
+
+    The substrate has no review-round cap: ``request_review`` and
+    ``reopen_review_task`` can alternate forever, and the only thing that
+    changes between rounds is the event log. A card self-reviewed by its own
+    profile will do exactly that.
+
+    Called from the dispatch-tick observer with the ids the tick just spawned,
+    which is one check per spawn — a card is in ``DispatchResult.spawned``
+    only on the tick it started, so each round costs one events read and
+    nothing at all on an idle tick.
+
+    Past the cap the card is blocked as ``needs_input``, which lands it in the
+    lane the operator already reads and fires ``kanban_task_blocked``, so the
+    existing :func:`on_blocked` push does the notifying. Blocking a running
+    card closes its run; the substrate's own ``reap_terminal_workers`` ends the
+    worker that outlives it. This is the one write this module makes without
+    an operator verb, which is why it has an off switch.
+    """
+    from hermes_cli import kanban_db, kanban_db_connect
+    ids = [str(i) for i in (task_ids or []) if i]
+    limit = review_round_limit() if limit is None else max(0, int(limit))
+    result = {"board": board, "limit": limit, "parked": [], "rounds": {}}
+    if not ids or not board or limit <= 0:
+        return result
+    db_path = kanban_db.kanban_db_path(board)
+    if not db_path.is_file():
+        return result
+    with kanban_db_connect.connect_closing(db_path=db_path) as conn:
+        for tid in ids:
+            task = kanban_db.get_task(conn, tid)
+            if task is None or task.status not in (RUNNING_STATUS,
+                                                   READY_STATUS):
+                continue
+            rounds = review_rounds(conn, tid)
+            if rounds < limit:
+                continue
+            result["rounds"][tid] = rounds
+            reason = (f"review loop: {rounds} review rounds without a human "
+                      f"decision (limit {limit})")
+            if kanban_db.block_task(conn, tid, kind=NEEDS_INPUT,
+                                    reason=reason):
+                result["parked"].append(tid)
+    return result
+
+
+def suppression_line(result) -> str:
+    """One line naming why a dispatch tick held ready work back, or ``""``.
+
+    Straight through to ``kanban_db_dispatch.describe_suppression`` so the
+    plugin's log and ``hermes kanban tail`` use the same words for the same
+    guard, and a wording change upstream never has to be mirrored here.
+    """
+    try:
+        from hermes_cli import kanban_db_dispatch
+        return kanban_db_dispatch.describe_suppression([result])
+    except Exception:  # noqa: BLE001 — a log line is never worth an exception
+        return ""

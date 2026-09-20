@@ -688,3 +688,87 @@ def test_dispatch_tick_never_raises(_teamhome, monkeypatch):
     assert hooks.on_dispatch_tick(result=None) is None
     assert hooks.on_dispatch_tick() is None
     assert hooks.on_dispatch_tick(result=object(), board=None) is None
+
+
+# ── the dispatch tick's two new jobs ─────────────────────────────────────────
+#
+# Both ride the same observer, which fires every few seconds forever. The
+# invariant that matters is what an IDLE tick costs: nothing at all.
+
+class _FullTick:
+    def __init__(self, *, auto_blocked=None, spawned=None, respawn_guarded=None):
+        self.auto_blocked = auto_blocked
+        self.spawned = spawned
+        self.respawn_guarded = respawn_guarded
+
+
+def test_dispatch_tick_makes_no_substrate_call_when_nothing_spawned(
+        _teamhome, monkeypatch):
+    from hermes_agent_synergia import approvals
+
+    def _never(*_a, **_kw):
+        raise AssertionError("an idle tick must not reach the substrate")
+
+    monkeypatch.setattr(approvals, "check_review_loop", _never)
+    monkeypatch.setattr(approvals, "suppression_line", _never)
+    monkeypatch.setattr(approvals, "on_auto_blocked", _never)
+    assert hooks.on_dispatch_tick(result=_FullTick(), board="px-board") is None
+    assert hooks.on_dispatch_tick(
+        result=_FullTick(spawned=[], respawn_guarded=[]),
+        board="px-board") is None
+
+
+def test_dispatch_tick_checks_the_review_loop_for_each_spawned_card(
+        _teamhome, monkeypatch):
+    """``spawned`` carries ``(task_id, assignee, workspace_path)`` triples —
+    the guard must read the id out, not the triple."""
+    from hermes_agent_synergia import approvals
+    seen = []
+    monkeypatch.setattr(
+        approvals, "check_review_loop",
+        lambda ids, board, **kw: seen.append((list(ids), board)) or
+        {"parked": [], "rounds": {}, "limit": 3})
+    hooks.on_dispatch_tick(
+        result=_FullTick(spawned=[("t_a", "dev", "/w/a"), ("t_b", "qa", "/w/b")]),
+        board="px-board")
+    assert seen == [(["t_a", "t_b"], "px-board")]
+
+
+def test_dispatch_tick_logs_the_suppression_reason_once(_teamhome, monkeypatch,
+                                                        caplog):
+    from hermes_agent_synergia import approvals
+    monkeypatch.setattr(approvals, "suppression_line",
+                        lambda _tick: "active_pr=1, rate_limited=2")
+    hooks.teardown()
+    tick = _FullTick(respawn_guarded=[("t_a", "active_pr")])
+    with caplog.at_level("INFO"):
+        hooks.on_dispatch_tick(result=tick, board="px-board")
+        hooks.on_dispatch_tick(result=tick, board="px-board")
+    said = [r for r in caplog.records if "holding ready work back" in r.message]
+    assert len(said) == 1
+    assert "active_pr=1, rate_limited=2" in said[0].getMessage()
+
+
+def test_review_loop_guard_never_costs_the_giveup_push(_teamhome, monkeypatch):
+    """Each job is isolated: a raising guard must not swallow the push that
+    ran before it, nor the suppression line after it."""
+    from hermes_agent_synergia import approvals
+    pushed = []
+    monkeypatch.setattr(approvals, "on_auto_blocked",
+                        lambda ids, board, **kw: pushed.append(list(ids)) or
+                        {"notified": [], "platforms": []})
+
+    def _boom(*_a, **_kw):
+        raise RuntimeError("events table is gone")
+
+    monkeypatch.setattr(approvals, "check_review_loop", _boom)
+    lines = []
+    monkeypatch.setattr(approvals, "suppression_line",
+                        lambda _t: lines.append(1) or "")
+    hooks.teardown()
+    assert hooks.on_dispatch_tick(
+        result=_FullTick(auto_blocked=["t_x"], spawned=[("t_y", "dev", "/w")],
+                         respawn_guarded=[("t_y", "active_pr")]),
+        board="px-board") is None
+    assert pushed == [["t_x"]]
+    assert lines == [1]

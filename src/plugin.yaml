@@ -30,5 +30,7 @@ config_schema:
                                                  description: "Naming template for instantiated profiles. Overridable per team."}
   dashboard_writes: {type: bool, default: true,  description: "Set false to restore read-only dashboard behaviour."}
   approvals_notify: {type: str, default: "home", description: "home | off — push cards blocked on a human decision, and cards the dispatcher gave up on, to every configured gateway home channel."}
+  review_round_limit: {type: int, default: 3,    description: "Review rounds a card may take before it is parked for a human decision. 0 disables the loop guard."}
+  parked_lanes:     {type: bool, default: true,  description: "Show review / triage / respawn-guarded cards in the approvals inbox alongside blocked ones."}
   worker_exit_guard: {type: str, default: "wrapper",
                                                  description: "wrapper | off — wrap dispatcher workers through $HERMES_BIN so a worker that never reached the model exits non-zero instead of being booked as a protocol violation."}

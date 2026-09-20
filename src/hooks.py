@@ -72,16 +72,21 @@ _LOGGED_FAILURE = False    # log-once flag so a broken file cannot spam the log
 _NOTIFIED: list = []
 _NOTIFIED_MAX = 256
 
+# The last suppression line logged, so a respawn guard that holds for hours
+# costs one log line instead of one per tick.
+_LAST_SUPPRESSION: str = ""
+
 
 def teardown() -> None:
     """``ctx.on_unload`` seam (§5.3): drop the registry cache, the profile
     index and the memoised path. Closes nothing else — the hot path opens
     nothing."""
-    global _PATH, _MEMO, _LAST_GOOD, _LOGGED_FAILURE
+    global _PATH, _MEMO, _LAST_GOOD, _LOGGED_FAILURE, _LAST_SUPPRESSION
     _PATH = _UNSET
     _MEMO = _UNSET
     _LAST_GOOD = None
     _LOGGED_FAILURE = False
+    _LAST_SUPPRESSION = ""
     _NOTIFIED.clear()
 
 
@@ -353,33 +358,89 @@ def _fresh(task_ids) -> list:
 
 
 def on_dispatch_tick(**kw: Any) -> None:
-    """The stuck lane's push: the cards the dispatcher's circuit breaker gave
-    up on this tick.
+    """Everything the dispatcher does that no other hook reports.
 
-    That path writes ``status='blocked'`` with a raw UPDATE and fires no
-    ``kanban_task_blocked``, so it is invisible to :func:`on_task_blocked`.
-    ``DispatchResult.auto_blocked`` is the id list.
+    Three jobs, each keyed off its own ``DispatchResult`` list:
+
+    * ``auto_blocked`` — the stuck lane's push. The circuit breaker writes
+      ``status='blocked'`` with a raw UPDATE and fires no
+      ``kanban_task_blocked``, so it is invisible to :func:`on_task_blocked`.
+    * ``spawned`` — the review-round loop guard (:func:`_check_review_loop`).
+    * ``respawn_guarded`` — why ready work is being held back
+      (:func:`_log_suppression`).
 
     This fires once per dispatcher tick — every few seconds, forever — and
-    almost always with an empty ``auto_blocked``, so the cost of the empty
-    case is one ``getattr`` and a falsy check: nothing is imported, no DB is
-    opened, the registry is not read. Only a non-empty list reaches
-    ``approvals`` (which owns every substrate call; ``hooks.py`` is not one of
-    the six files allowed to import ``hermes_cli``). An observer, so it never
-    raises.
+    almost always with all three empty, so the cost of the idle case is three
+    ``getattr``s and three falsy checks: nothing is imported, no DB is opened,
+    the registry is not read. Only a non-empty list reaches ``approvals``
+    (which owns every substrate call; ``hooks.py`` is not one of the six files
+    allowed to import ``hermes_cli``). An observer, so it never raises — and
+    each job is isolated, so one failing never costs the other two.
+    """
+    tick = kw.get("result")
+    board = str(kw.get("board") or "")
+    try:
+        given_up = getattr(tick, "auto_blocked", None)
+        fresh = _fresh([str(tid) for tid in given_up if tid]) if given_up else []
+        if fresh:
+            from . import approvals
+            result = approvals.on_auto_blocked(fresh, board)
+            if result.get("notified"):
+                log.info("hermes-agent-synergia: dispatcher gave up on %s, pushed to %s",
+                         ", ".join(result["notified"]),
+                         ", ".join(result["platforms"]) or "(no home channel)")
+    except Exception:                              # noqa: BLE001 — observer
+        pass
+    _check_review_loop(tick, board)
+    _log_suppression(tick)
+    return None
+
+
+def _check_review_loop(tick, board: str) -> None:
+    """Park a card that has gone round the review loop too many times.
+
+    Driven off ``DispatchResult.spawned`` because a card appears there exactly
+    once per run: one events read per spawn, and on the overwhelmingly common
+    idle tick a single ``getattr`` and a falsy check. ``spawned`` carries
+    ``(task_id, assignee, workspace_path)`` triples.
+
+    The DB work — and the block itself — belongs to ``approvals``: ``hooks.py``
+    is not one of the six files allowed to import ``hermes_cli``.
     """
     try:
-        given_up = getattr(kw.get("result"), "auto_blocked", None)
-        if not given_up:
-            return None
-        fresh = _fresh([str(tid) for tid in given_up if tid])
-        if not fresh:
+        spawned = getattr(tick, "spawned", None)
+        if not spawned or not board:
             return None
         from . import approvals
-        result = approvals.on_auto_blocked(fresh, str(kw.get("board") or ""))
-        if result.get("notified"):
-            log.info("hermes-agent-synergia: dispatcher gave up on %s, pushed to %s",
-                     ", ".join(result["notified"]),
-                     ", ".join(result["platforms"]) or "(no home channel)")
+        result = approvals.check_review_loop(
+            [str(row[0]) for row in spawned if row and row[0]], board)
+        for tid in result.get("parked", ()):
+            log.warning(
+                "hermes-agent-synergia: card %s parked for a human after %s "
+                "review rounds (limit %s) — review loop guard",
+                tid, result["rounds"].get(tid), result["limit"])
+    except Exception:                              # noqa: BLE001 — observer
+        return None
+
+
+def _log_suppression(tick) -> None:
+    """Say out loud why a tick held ready work back.
+
+    ``respawn_guarded`` never blocks a card and never fires a hook, so without
+    this the only place the reason is written is ``hermes kanban tail``. Logged
+    once per distinct reason set, so a guard that holds for hours costs one
+    line, not one per tick.
+    """
+    global _LAST_SUPPRESSION
+    try:
+        if not getattr(tick, "respawn_guarded", None):
+            return None
+        from . import approvals
+        line = approvals.suppression_line(tick)
+        if not line or line == _LAST_SUPPRESSION:
+            return None
+        _LAST_SUPPRESSION = line
+        log.info("hermes-agent-synergia: dispatcher holding ready work back: %s",
+                 line)
     except Exception:                              # noqa: BLE001 — observer
         return None

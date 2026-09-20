@@ -323,7 +323,9 @@ def test_cli_approvals_lists_both_lanes_and_filters_by_kind(alpha, parser,
     code, env, _out = _run(parser, "approvals", "--json", capsys=capsys)
     assert code == 0
     assert env["data"]["count"] == 2
-    assert env["data"]["counts"] == {"needs_input": 1, "stuck": 1}
+    # Every lane, zeros included — the badge's key set never varies.
+    assert env["data"]["counts"] == {"needs_input": 1, "stuck": 1, "review": 0,
+                                     "triage": 0, "guarded": 0}
     assert {r["id"] for r in env["data"]["approvals"]} == \
         {alpha["waiting"], alpha["other"]}
 
@@ -815,3 +817,169 @@ def test_cli_note_says_when_the_worker_hears_it(alpha, parser, capsys):
     assert code == 0
     assert "~6s" in out.err
     assert "hermes kanban unblock" not in out.err      # a note never unblocks
+
+
+# ── the parked lanes nothing in the substrate moves on its own ───────────────
+#
+# Regression for the Release button that "did nothing": the card it released
+# went back to `review`, which no lane predicate covered, so the inbox never
+# showed it again and `kanban.review_dispatch: false` meant no agent run would
+# ever pick it up either.
+
+def _review_card(board, tenant, **kw):
+    from hermes_cli import kanban_db
+    tid = _card(board, tenant=tenant, **kw)
+    with _conn(board) as conn:
+        assert kanban_db.request_review(conn, tid, summary="ready for review",
+                                        force=True)
+    return tid
+
+
+def _guard_event(board, tid, reason="blocker_auth"):
+    """What ``check_respawn_guard`` leaves behind: an event, and the row
+    exactly where it was. There is no public writer for it, so the fixture
+    writes the row the dispatcher writes."""
+    import json as _json
+    with _conn(board) as conn:
+        conn.execute(
+            "INSERT INTO task_events (task_id, run_id, kind, payload, created_at) "
+            "VALUES (?, NULL, 'respawn_guarded', ?, strftime('%s','now'))",
+            (tid, _json.dumps({"reason": reason})))
+        conn.commit()
+
+
+def test_kind_of_reads_the_three_lanes_the_substrate_parks_silently(alpha):
+    from hermes_cli import kanban_db
+    review = _review_card("alpha", "alpha", title="design")
+    triage = _card("alpha", tenant="alpha", title="loops")
+    _force_status("alpha", triage, "triage")
+    guarded = _card("alpha", tenant="alpha", title="held")
+    _force_status("alpha", guarded, "ready")
+    _guard_event("alpha", guarded)
+    with _conn("alpha") as conn:
+        lanes = {tid: approvals.kind_of(
+            kanban_db.get_task(conn, tid),
+            approvals._park_facts(conn, tid)[2])
+            for tid in (review, triage, guarded)}
+    assert lanes == {review: "review", triage: "triage", guarded: "guarded"}
+
+    t = storage.load().teams["alpha"]
+    rows = {r["id"]: r for r in approvals.queue(t)}
+    assert {review, triage, guarded} <= set(rows)
+    assert rows[guarded]["guard_reason"] == "blocker_auth"
+    assert approvals.lane_counts(t)["review"] == 1
+
+
+def test_approve_completes_a_review_card_and_promotes_its_child(alpha):
+    """The original defect end to end: a `review` card is the operator's to
+    decide, and nothing else can decide it once `review_dispatch` is off."""
+    from hermes_cli import kanban_db
+    parent = _review_card("alpha", "alpha", title="the design")
+    with _conn("alpha") as conn:
+        child = kanban_db.create_task(conn, title="build it", tenant="alpha",
+                                      parents=[parent], board="alpha")
+        conn.commit()
+        assert kanban_db.get_task(conn, child).status == "todo"
+
+    t = storage.load().teams["alpha"]
+    res = approvals.approve(t, parent, "A: ship the OAuth design")
+    assert res["lane"] == "review"
+    assert res["transition"] == "completed"
+    assert res["status"] == "done"
+    with _conn("alpha") as conn:
+        assert kanban_db.get_task(conn, child).status == "ready"
+    assert approvals.queue(t) == [r for r in approvals.queue(t)
+                                  if r["id"] != parent]
+
+
+def test_reject_sends_a_review_card_back_instead_of_completing_it(alpha):
+    review = _review_card("alpha", "alpha", title="the design")
+    t = storage.load().teams["alpha"]
+    res = approvals.reject(t, review, "split the migration out first")
+    assert res["transition"] == "reopened"
+    assert res["status"] != "done"
+    assert _status_of("alpha", review)[0] != "review"
+
+
+def test_release_on_a_guarded_card_clears_the_failure_the_guard_reads(alpha):
+    """`blocker_auth` matches `last_failure_error`, so the stale failure text
+    is what traps the card — clearing it is the whole release."""
+    from hermes_cli import kanban_db
+    guarded = _card("alpha", tenant="alpha", title="held")
+    with _conn("alpha") as conn:
+        conn.execute("UPDATE tasks SET status = 'ready', "
+                     "last_failure_error = ?, consecutive_failures = 2 "
+                     "WHERE id = ?", ("429 quota exceeded", guarded))
+        conn.commit()
+    _guard_event("alpha", guarded)
+
+    t = storage.load().teams["alpha"]
+    res = approvals.release(t, guarded, "topped the quota up")
+    assert res["lane"] == "guarded"
+    assert res["transition"] == "cleared_guard"
+    with _conn("alpha") as conn:
+        after = kanban_db.get_task(conn, guarded)
+    assert after.status == "ready"
+    assert not after.last_failure_error
+    assert after.consecutive_failures == 0
+
+
+def test_release_specifies_a_triage_card_back_into_the_queue(alpha):
+    triage = _card("alpha", tenant="alpha", title="loops")
+    _force_status("alpha", triage, "triage")
+    t = storage.load().teams["alpha"]
+    res = approvals.release(t, triage, "the endpoint is back")
+    assert res["transition"] == "specified"
+    # out of triage and schedulable again (`ready` with no parent to wait on)
+    assert _status_of("alpha", triage)[0] == "ready"
+
+
+def test_a_refusal_names_the_verb_that_moves_the_card_in_every_lane(alpha):
+    triage = _card("alpha", tenant="alpha", title="loops")
+    _force_status("alpha", triage, "triage")
+    review = _review_card("alpha", "alpha", title="the design")
+    t = storage.load().teams["alpha"]
+
+    with pytest.raises(Exception) as exc:
+        approvals.approve(t, triage, "looks fine")
+    assert "hermes team release" in exc.value.remedy
+
+    with pytest.raises(Exception) as exc:
+        approvals.release(t, review, "run it again")
+    assert "hermes team approve" in exc.value.remedy
+
+
+# ── the review-loop guard ────────────────────────────────────────────────────
+
+def _review_rounds(board, tid, n):
+    """*n* real round trips through the substrate's own review transitions —
+    the loop a self-reviewing agent runs, not a hand-written event log."""
+    from hermes_cli import kanban_db
+    with _conn(board) as conn:
+        for _ in range(n):
+            assert kanban_db.request_review(conn, tid, summary="round",
+                                            force=True)
+            assert kanban_db.reopen_review_task(conn, tid)
+
+
+def test_check_review_loop_parks_a_card_that_never_leaves_the_loop(alpha):
+    tid = _card("alpha", tenant="alpha", title="self-reviewed")
+    _review_rounds("alpha", tid, 3)
+    res = approvals.check_review_loop([tid], "alpha", limit=3)
+    assert res["parked"] == [tid]
+    assert res["rounds"][tid] == 3
+    assert _status_of("alpha", tid) == ("blocked", "needs_input")
+    # and it lands in the lane the operator already reads
+    t = storage.load().teams["alpha"]
+    assert tid in {r["id"] for r in approvals.pending(t)}
+
+
+def test_check_review_loop_is_a_no_op_below_the_cap_and_when_disabled(alpha):
+    tid = _card("alpha", tenant="alpha", title="two rounds")
+    _review_rounds("alpha", tid, 2)
+    assert approvals.check_review_loop([tid], "alpha", limit=3)["parked"] == []
+    assert approvals.check_review_loop([tid], "alpha", limit=0)["parked"] == []
+
+    _review_rounds("alpha", tid, 5)
+    assert approvals.check_review_loop([tid], "alpha", limit=0)["parked"] == []
+    assert _status_of("alpha", tid)[0] != "blocked"
