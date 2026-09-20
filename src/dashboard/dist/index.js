@@ -2249,11 +2249,12 @@
 
     const statusPoll = usePoll("/teams/" + encodeURIComponent(slug) + "/status", true,
       [refreshKey], tab === "kanban" ? BOARD_FOCUS_MS : BOARD_POLL_MS);
-    // Which blocked card is parked on a HUMAN: `status` only says "blocked",
-    // and a stuck card is released, not answered (approvals.py refuses the
-    // mix-up). The lane tag is the one place that difference is readable.
+    // Every lane: `status` alone cannot tell a card that owes a human verdict
+    // from one that owes a retry, and approvals.py refuses the mix-up.
+    // `reason_kind` on the row is the one place that difference is readable,
+    // and it is what ApprovalCard switches its verbs on.
     const approvalsPoll = usePoll(
-      "/teams/" + encodeURIComponent(slug) + "/approvals?kind=needs_input", true,
+      "/teams/" + encodeURIComponent(slug) + "/approvals", true,
       [refreshKey], BUSY_POLL_MS);
 
     const status = statusPoll.data;
@@ -2276,10 +2277,15 @@
     const rootId = (pinnedRoot && byId[pinnedRoot] ? pinnedRoot : null) ||
       liveRoot || (roots[0] || {}).id || null;
 
-    const waiting = ((approvalsPoll.data || {}).approvals || []).filter(function (row) {
+    const parkedRows = ((approvalsPoll.data || {}).approvals || []).filter(function (row) {
       const task = byId[row.id];
       return task && (task.root_id || task.id) === rootId;
-    })[0];
+    });
+    // A decision outranks a release when both sit under this thread. `waiting`
+    // is the lanes that owe a human verdict, because it is what arms the
+    // Composer's answer mode — a release is not an answer.
+    const waiting = parkedRows.filter(owesDecision)[0] || null;
+    const parked = waiting || parkedRows[0] || null;
     const running = tasks.filter(function (task) {
       return task.status === "running" && (task.root_id || task.id) === rootId;
     })[0];
@@ -2334,8 +2340,8 @@
       // The decision lives where the work is read: the same ApprovalCard the
       // inbox draws, so the artifacts, the block reason and the verbs are all
       // here instead of one screen away in Settings.
-      tab === "chat" && waiting ? h(ApprovalCard, {
-        slug: slug, row: waiting, readOnly: props.readOnly,
+      tab === "chat" && parked ? h(ApprovalCard, {
+        slug: slug, row: parked, readOnly: props.readOnly,
         onReadOnly: props.onReadOnly,
         onDecided: function () { approvalsPoll.reload(); reload(); },
       }) : null,
@@ -2597,30 +2603,88 @@
   }
 
   // ═══════════════════════════════════════════════════════════════════════════
-  // Approvals — the cards parked on a human decision
+  // Approvals — every card nothing moves on its own
   //
-  // A card waits on a human iff status == "blocked" AND block_kind ==
-  // "needs_input". approvals.py owns that predicate and the CLI calls the same
-  // functions, so the two surfaces cannot drift. A decision posts a comment and
-  // unblocks: neither surface ever completes the card — the assignee resumes,
-  // acts on the note and completes it, which promotes the children.
+  // Five lanes, and `reason_kind` on the row is the only place the difference
+  // is readable. approvals.py owns every lane predicate and the CLI calls the
+  // same functions, so the two surfaces cannot drift. Two lanes owe a human
+  // verdict, three owe a retry, and the verb buttons below are chosen from the
+  // lane — never from a boolean, which is how the Release button once became a
+  // dead end on a card no release could reach.
   // ═══════════════════════════════════════════════════════════════════════════
+
+  // In approvals.QUEUE_KINDS order. Rows from an older backend carry no
+  // reason_kind, which reads as the needs_input lane.
+  const PARK_LANES = {
+    needs_input: {
+      mark: null, wait: "waiting ", verbs: ["reject", "approve"], hint: "",
+    },
+    stuck: {
+      mark: "STUCK", wait: "stuck ", verbs: ["release"],
+      hint: "Blocked with nobody to answer — release it to put it back in the pool.",
+    },
+    review: {
+      mark: "REVIEW", wait: "in review ", verbs: ["reject", "approve"],
+      hint: "Finished and waiting for your verdict. Approving completes the card, which releases anything waiting behind it.",
+    },
+    triage: {
+      mark: "TRIAGE", wait: "in triage ", verbs: ["release"],
+      hint: "Routed to triage after repeated blocks for the same cause. Nothing schedules a triage card — release it to send it back to todo.",
+    },
+    guarded: {
+      mark: "GUARDED", wait: "held ", verbs: ["release"],
+      hint: "The dispatcher is holding this card back and will not start it again until the cause is cleared.",
+    },
+  };
+
+  const PARK_LANE_LABEL = {
+    needs_input: "blocked on a decision", stuck: "stuck", review: "in review",
+    triage: "in triage", guarded: "held by the dispatcher",
+  };
+
+  // check_respawn_guard's own reason codes, in operator words. The codes are
+  // the substrate's; only this gloss is ours.
+  const GUARD_GLOSS = {
+    blocker_auth: "a quota / auth / billing error is still on the card",
+    rate_limit_cooldown: "waiting out a provider rate-limit cooldown — this one clears itself",
+    recent_success: "a run completed recently",
+    active_pr: "a pull request is open on this card",
+  };
+
+  function laneOf(row) {
+    return PARK_LANES[row.reason_kind] ? row.reason_kind : "needs_input";
+  }
+
+  // The two lanes that owe a human verdict — the rest are released.
+  function owesDecision(row) {
+    return PARK_LANES[laneOf(row)].verbs.indexOf("approve") !== -1;
+  }
 
   const DECISIONS = {
     approve: {
       label: "Approve", busyLabel: "Approving…", field: "note",
       prompt: "Your decision, in the words the assignee needs (\"A: OAuth application-only\").",
+      prompts: {
+        review: "Your verdict. The card is completed with this as its result, and anything waiting behind it starts.",
+      },
     },
     reject: {
       label: "Request changes", busyLabel: "Sending…", field: "reason",
       prompt: "What must change before this can be approved.",
+      prompts: {
+        review: "What must change. The card is reopened to whoever did the work.",
+      },
     },
-    // The stuck lane: no decision to record, so the note is the instruction
-    // the assignee reads on the re-run. POST …/release comments + unblocks,
-    // which also resets the retry budget the circuit breaker spent.
+    // The three lanes with no decision to record, so the note is the
+    // instruction read on the re-run. POST …/release picks the move from the
+    // lane: unblock, specify out of triage, or clear the dispatcher's hold.
     release: {
       label: "Release", busyLabel: "Releasing…", field: "note",
       prompt: "What the assignee should do differently on the re-run.",
+      prompts: {
+        triage: "Why this is worth another attempt, and what should change. The card goes back to todo.",
+        guarded: "Fix the cause outside Hermes FIRST — the dispatcher is holding this card for a reason it can still see. Then say what changed.",
+      },
     },
   };
 
@@ -2683,6 +2747,7 @@
 
   function DecisionForm(props) {
     const spec = DECISIONS[props.action];
+    const prompt = (spec.prompts || {})[props.lane] || spec.prompt;
     const [text, setText] = hooks.useState("");
     const [park, setPark] = hooks.useState(false);
     const [busy, setBusy] = hooks.useState(false);
@@ -2711,7 +2776,7 @@
 
     return h("div", { className: "ht-decide" },
       error ? h(ErrorNote, { error: error, what: "This card" }) : null,
-      h(Field, { label: spec.field, htmlFor: id, hint: spec.prompt },
+      h(Field, { label: spec.field, htmlFor: id, hint: prompt },
         h("textarea", {
           id: id, className: "ht-textarea", rows: 4, value: text,
           disabled: props.readOnly || busy,
@@ -2739,28 +2804,38 @@
     const [action, setAction] = hooks.useState(null);
     const [openFile, setOpenFile] = hooks.useState(null);
     const attachments = row.attachments || [];
-    // reason_kind is the lane: "needs_input" waits on a decision (approve /
-    // request changes), "stuck" waits on nobody (release). Rows from an older
-    // backend carry no reason_kind, which reads as the needs_input lane.
-    const stuck = row.reason_kind === "stuck";
+    const lane = laneOf(row);
+    const spec = PARK_LANES[lane];
+    // What the operator needs before deciding: the lane's own sentence, then
+    // the substrate's own words for why this card in particular is parked.
+    // block_kind is what separates "the agent could not do it" (capability —
+    // fix the cause first) from a bare dispatcher give-up.
+    const why = [];
+    if (row.guard_reason) {
+      why.push(row.guard_reason +
+        (GUARD_GLOSS[row.guard_reason] ? " — " + GUARD_GLOSS[row.guard_reason] : ""));
+    }
+    if (row.failure_error || row.block_reason) why.push(row.failure_error || row.block_reason);
+    if (!why.length && spec.hint) why.push(spec.hint);
+    if (row.block_kind === "capability") {
+      why.push("block_kind=capability — the agent could not do it; fix the cause before releasing.");
+    }
+    if (row.consecutive_failures) {
+      why.push(row.consecutive_failures + " consecutive failure(s) before it was blocked.");
+    }
 
     return h("div", { className: "ht-approval" },
       h("div", { className: "ht-approval-head" },
         h("div", { className: "ht-row" },
           h("code", { className: "ht-code" }, row.id),
-          stuck ? h("span", { className: "ht-approval-stuck" }, "STUCK") : null,
+          spec.mark ? h("span", { className: "ht-approval-stuck" }, spec.mark) : null,
           h("span", { className: "ht-approval-wait" },
-            (stuck ? "stuck " : "waiting ") + ageOf(row.blocked_at || row.created_at)),
+            spec.wait + ageOf(row.blocked_at || row.created_at)),
           h(AssigneeChip, { assignee: row.assignee })
         ),
         h("strong", { className: "ht-run-title" }, row.title || "")
       ),
-      stuck ? h("p", { className: "ht-hint" },
-        (row.failure_error || row.block_reason ||
-          "Blocked with nobody to answer — release it to put it back in the pool.") +
-        (row.consecutive_failures
-          ? "  (" + row.consecutive_failures + " consecutive failure(s))" : "")
-      ) : (row.block_reason ? h("p", { className: "ht-hint" }, row.block_reason) : null),
+      why.length ? h("p", { className: "ht-hint" }, why.join("  ")) : null,
       row.headline ? h("blockquote", { className: "ht-quote" }, row.headline) : null,
       attachments.length ? h("div", { className: "ht-row ht-approval-files" },
         h(Muted, null, "artifacts"),
@@ -2783,29 +2858,24 @@
         onClose: function () { setOpenFile(null); },
       }) : null,
       action ? h(DecisionForm, {
-        key: action, slug: props.slug, task: row, action: action,
+        key: action, slug: props.slug, task: row, action: action, lane: lane,
         readOnly: props.readOnly, onReadOnly: props.onReadOnly,
         onCancel: function () { setAction(null); },
         onDone: function (data) { setAction(null); props.onDecided(data); },
       }) : h("div", { className: "ht-row ht-row-end" },
-        stuck ? h(UI.Button, {
-          size: "sm", disabled: props.readOnly,
-          onClick: function () { setAction("release"); },
-        }, "Release") : null,
-        stuck ? null : h(UI.Button, {
-          size: "sm", outlined: true, disabled: props.readOnly,
-          onClick: function () { setAction("reject"); },
-        }, "Request changes"),
-        stuck ? null : h(UI.Button, {
-          size: "sm", disabled: props.readOnly,
-          onClick: function () { setAction("approve"); },
-        }, "Approve")
+        spec.verbs.map(function (verb) {
+          return h(UI.Button, {
+            key: verb, size: "sm", outlined: verb === "reject",
+            disabled: props.readOnly,
+            onClick: function () { setAction(verb); },
+          }, DECISIONS[verb].label);
+        })
       )
     );
   }
 
   // Silent when nothing waits: this is an alert surface, mounted above the
-  // pill bar so a waiting or stuck card is visible whichever panel is open.
+  // pill bar so a parked card is visible whichever panel is open.
   function ApprovalsPanel(props) {
     const slug = props.team.slug;
     const poll = usePoll("/teams/" + encodeURIComponent(slug) + "/approvals", true,
@@ -2813,9 +2883,11 @@
     const rows = (poll.data && poll.data.approvals) || [];
     if (!poll.data || !rows.length) return null;
     const counts = (poll.data && poll.data.counts) || {};
-    const lanes = [];
-    if (counts.needs_input) lanes.push(counts.needs_input + " blocked on a decision");
-    if (counts.stuck) lanes.push(counts.stuck + " stuck");
+    const lanes = Object.keys(PARK_LANES).filter(function (k) {
+      return counts[k];
+    }).map(function (k) {
+      return counts[k] + " " + PARK_LANE_LABEL[k];
+    });
 
     return h("div", { className: "ht-panel ht-approvals" },
       h("div", { className: "ht-panel-head" },
@@ -2823,7 +2895,7 @@
           h("h3", null, "Waiting for you"),
           h(UI.Badge, { tone: "warning" }, String(rows.length))
         ),
-        h(Muted, null, (lanes.join(" · ") || "blocked on a human decision") +
+        h(Muted, null, (lanes.join(" · ") || "parked with nothing moving them") +
           " · polling every 5s")
       ),
       props.readOnly
@@ -2848,7 +2920,7 @@
     return h("span", { className: "ht-approvals-slot", ref: ref },
       h(HostLink, {
         to: "/synergia", rootRef: ref, className: "ht-approvals-badge",
-        title: count + " card(s) blocked on your decision or stuck — open Synergia",
+        title: count + " parked card(s) — nothing moves them until you do. Open Synergia",
       },
         h("span", { className: "ht-approvals-dot" }),
         String(count) + " waiting"

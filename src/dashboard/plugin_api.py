@@ -909,24 +909,27 @@ def get_team_task_log(request: Request, slug: str, task_id: str):
 #
 # Thin wrappers over ``approvals.py`` — the CLI calls the same functions, so
 # the predicates, the comment bodies and the refusals cannot drift between the
-# two surfaces. Both lanes come back in one list: cards parked on a human
-# decision and stuck cards, each row tagged with ``reason_kind`` and counted in
-# ``counts``, which is what lets the UI show one panel with two behaviours.
-# ``GET /approvals`` is registry-wide and is the ONLY source the header badge
-# reads: the badge is what makes a waiting card findable from any dashboard
-# page.
+# two surfaces. Every lane comes back in one list — needs_input, stuck,
+# review, triage, guarded — each row tagged with ``reason_kind`` and counted
+# in ``counts``, which is what lets the UI show one panel and pick the verb
+# per row. ``GET /approvals`` is registry-wide and is the ONLY source the
+# header badge reads: the badge is what makes a parked card findable from any
+# dashboard page.
 
 def _kinds(request: Request):
     """The ``?kind=`` filter, mirroring the CLI's ``--kind``. Anything else is
-    both lanes — a bad query narrows nothing rather than 400-ing a read."""
+    every lane — a bad query narrows nothing rather than 400-ing a read."""
     approvals = _mod("approvals")
     kind = (request.query_params.get("kind") or "all").strip()
-    return (kind,) if kind in approvals.QUEUE_KINDS else approvals.QUEUE_KINDS
+    # ``None`` — not the whole tuple — so the unfiltered read honours the
+    # ``parked_lanes`` setting. An explicit ``?kind=`` is the operator asking
+    # for that lane by name and overrides it.
+    return (kind,) if kind in approvals.QUEUE_KINDS else None
 
 
 @router.get("/approvals")
 def get_approvals(request: Request):
-    """Every team's waiting and stuck cards, newest wait first."""
+    """Every team's parked cards, every lane, newest wait first."""
     approvals = _mod("approvals")
     rows = approvals.queue_all(kinds=_kinds(request))
     return _ok({"count": len(rows), "counts": _lane_counts(rows),
@@ -948,15 +951,23 @@ def get_team_approvals(request: Request, slug: str):
 
 
 def _lane_counts(rows) -> dict:
-    """``{needs_input: n, stuck: m}`` — the panel subtitle and the badge."""
-    stuck = sum(1 for r in rows if r.get("reason_kind") == "stuck")
-    return {"needs_input": len(rows) - stuck, "stuck": stuck}
+    """``{lane: n}`` over every lane — the panel subtitle and the badge.
+
+    Zeros included: the UI indexes this without a guard, and a badge whose
+    key set changes with the data flickers.
+    """
+    approvals = _mod("approvals")
+    out = dict.fromkeys(approvals.QUEUE_KINDS, 0)
+    for r in rows:
+        kind = r.get("reason_kind")
+        if kind in out:
+            out[kind] += 1
+    return out
 
 
 @router.get("/teams/{slug}/tasks/{task_id}/approval")
 def get_team_task_approval(slug: str, task_id: str):
-    """One waiting or stuck card in full: body, every comment, the artifact
-    list."""
+    """One parked card in full: body, every comment, the artifact list."""
     approvals = _mod("approvals")
     t, err, _reg, _storage = _team_or_404(slug)
     if err is not None:
@@ -1024,25 +1035,39 @@ async def _decision_route(request: Request, slug: str, task_id: str,
 
 @router.post("/teams/{slug}/tasks/{task_id}/approve")
 async def post_team_task_approve(request: Request, slug: str, task_id: str):
-    """``{note, confirm: "<task_id>"}`` — comment + unblock. The card is NOT
-    completed here: the assignee resumes, acts on the note and completes it,
-    which is what promotes the children."""
+    """``{note, confirm: "<task_id>"}`` — the lane picks the move.
+
+    On a ``needs_input`` card: comment + unblock, and the assignee resumes,
+    acts on the note and completes it. On a ``review`` card: comment +
+    complete, because the operator has just made the only decision that card
+    was waiting for and no agent run will make it again. Either way the
+    children are promoted by the completion, not by this route.
+    """
     return await _decision_route(request, slug, task_id, action="approve")
 
 
 @router.post("/teams/{slug}/tasks/{task_id}/reject")
 async def post_team_task_reject(request: Request, slug: str, task_id: str):
-    """``{reason, confirm: "<task_id>", park?}`` — comment + unblock so the
-    agent reworks; ``park: true`` leaves the card blocked."""
+    """``{reason, confirm: "<task_id>", park?}`` — comment, then rework.
+
+    ``needs_input`` unblocks; ``review`` reopens to the implementer named in
+    the ``review_requested`` event. ``park: true`` records the comment and
+    moves nothing.
+    """
     return await _decision_route(request, slug, task_id, action="reject")
 
 
 @router.post("/teams/{slug}/tasks/{task_id}/release")
 async def post_team_task_release(request: Request, slug: str, task_id: str):
-    """``{note, confirm: "<task_id>"}`` — comment + unblock on a STUCK card,
-    which also resets its retry budget. Refused on a card waiting for a human
-    decision: that one is approved or rejected, so the decision reaches the
-    agent as a decision."""
+    """``{note, confirm: "<task_id>"}`` — put a parked card back in the pool.
+
+    One verb over the three lanes no human verdict is owed on: ``stuck``
+    unblocks and resets the retry budget, ``triage`` specifies back to
+    ``todo``, ``guarded`` clears the stale failure the dispatcher's respawn
+    guard reads. Refused on a card waiting for a human decision
+    (``needs_input``, ``review``): that one is approved or rejected, so the
+    decision reaches the agent as a decision.
+    """
     return await _decision_route(request, slug, task_id, action="release")
 
 

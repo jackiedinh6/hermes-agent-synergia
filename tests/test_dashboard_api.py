@@ -1431,7 +1431,8 @@ def test_approvals_carry_the_lane_tag_and_the_counts(client, waiting):
     stuck = _giveup_card("px", "px")
     data = client.get(f"{P}/approvals").json()["data"]
     assert data["count"] == 2
-    assert data["counts"] == {"needs_input": 1, "stuck": 1}
+    assert data["counts"] == {"needs_input": 1, "stuck": 1, "review": 0,
+                              "triage": 0, "guarded": 0}
     kinds = {r["id"]: r["reason_kind"] for r in data["approvals"]}
     assert kinds == {waiting["task_id"]: "needs_input", stuck: "stuck"}
     row = next(r for r in data["approvals"] if r["id"] == stuck)
@@ -1468,7 +1469,8 @@ def test_release_unblocks_the_stuck_card_and_clears_the_lane(client, waiting):
     assert data["status"] != "done"
     assert _task_row(None, "px", tid)["status"] != "blocked"
     after = client.get(f"{P}/approvals").json()["data"]
-    assert after["counts"] == {"needs_input": 1, "stuck": 0}
+    assert after["counts"] == {"needs_input": 1, "stuck": 0, "review": 0,
+                               "triage": 0, "guarded": 0}
 
 
 def test_release_on_a_card_waiting_for_a_human_is_400(client, waiting):
@@ -1610,3 +1612,75 @@ def test_task_tree_events_and_comments_are_independent(client, steerable):
     assert row["comments"] and "events" in row
     # The comment is not also an event: one message, one entry in the thread.
     assert "commented" not in [e["kind"] for e in row["events"]]
+
+
+# ── the three lanes the substrate parks silently ─────────────────────────────
+#
+# Regression for the Release button that "did nothing": the card it released
+# went back to `review`, which no route ever listed again.
+
+def _review_card(board, tenant, *, title="the design"):
+    from hermes_cli import kanban_db, kanban_db_connect
+    with kanban_db_connect.connect_closing(
+            db_path=kanban_db.kanban_db_path(board)) as conn:
+        tid = kanban_db.create_task(
+            conn, title=title, body="the proposal", assignee="qa",
+            tenant=tenant, initial_status="running", board=board)
+        assert kanban_db.request_review(conn, tid, summary="ready", force=True)
+    return tid
+
+
+def _triage_card(board, tenant):
+    from hermes_cli import kanban_db, kanban_db_connect
+    with kanban_db_connect.connect_closing(
+            db_path=kanban_db.kanban_db_path(board)) as conn:
+        tid = kanban_db.create_task(
+            conn, title="loops", assignee="qa", tenant=tenant,
+            initial_status="running", board=board)
+        conn.execute("UPDATE tasks SET status='triage' WHERE id=?", (tid,))
+        conn.commit()
+    return tid
+
+
+def test_kind_filter_narrows_to_one_parked_lane(client, waiting):
+    review = _review_card("px", "px")
+    triage = _triage_card("px", "px")
+    data = client.get(f"{P}/approvals").json()["data"]
+    assert {r["id"] for r in data["approvals"]} >= {review, triage,
+                                                    waiting["task_id"]}
+    assert data["counts"]["review"] == 1 and data["counts"]["triage"] == 1
+
+    only = client.get(f"{P}/teams/px/approvals?kind=triage").json()["data"]
+    assert [r["id"] for r in only["approvals"]] == [triage]
+    assert only["counts"]["triage"] == 1 and only["counts"]["review"] == 0
+
+
+def test_approve_completes_a_review_card_through_the_route(client, waiting):
+    from hermes_cli import kanban_db, kanban_db_connect
+    tid = _review_card("px", "px")
+    r = client.post(f"{P}/teams/px/tasks/{tid}/approve",
+                    json={"note": "A: ship it", "confirm": tid})
+    assert r.status_code == 200, r.text
+    data = r.json()["data"]
+    assert data["lane"] == "review" and data["transition"] == "completed"
+    assert data["status"] == "done"
+    with kanban_db_connect.connect_closing(
+            db_path=kanban_db.kanban_db_path("px")) as conn:
+        assert kanban_db.get_task(conn, tid).status == "done"
+    assert tid not in {r["id"] for r in
+                       client.get(f"{P}/approvals").json()["data"]["approvals"]}
+
+
+def test_release_moves_a_triage_card_and_is_refused_on_a_review_card(client,
+                                                                     waiting):
+    triage = _triage_card("px", "px")
+    r = client.post(f"{P}/teams/px/tasks/{triage}/release",
+                    json={"note": "the endpoint is back", "confirm": triage})
+    assert r.status_code == 200, r.text
+    assert r.json()["data"]["transition"] == "specified"
+
+    review = _review_card("px", "px")
+    r = client.post(f"{P}/teams/px/tasks/{review}/release",
+                    json={"note": "run it again", "confirm": review})
+    assert r.status_code == 400
+    assert "hermes team approve" in r.json()["error"]["remedy"]
