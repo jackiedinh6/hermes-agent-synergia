@@ -1651,8 +1651,7 @@
     const teams = props.teams || [];
     return h("div", { className: "ht-rail" },
       h("div", { className: "ht-rail-head" },
-        h("span", { className: "ht-kicker" }, "teams"),
-        h(UI.Button, { size: "sm", ghost: true, onClick: props.onReload }, "Reload")
+        h("span", { className: "ht-kicker" }, "teams")
       ),
       teams.length
         ? h("div", { className: "ht-rail-list" }, teams.map(function (row) {
@@ -3075,7 +3074,6 @@
           h("p", { className: "ht-muted" }, team.description || "")
         ),
         h("div", { className: "ht-row" },
-          h(UI.Button, { size: "sm", outlined: true, onClick: reload }, "Reload"),
           h(UI.Button, {
             size: "sm", outlined: true, destructive: true, disabled: props.readOnly,
             onClick: function () { destroy.request(team.slug); },
@@ -4574,15 +4572,14 @@
               { value: "chat", label: "Chat" },
               { value: "settings", label: "Settings" },
             ],
-          }),
-          h(UI.Button, { size: "sm", outlined: true, onClick: reloadAll }, "Reload")
+          })
         )
       ),
       readOnly ? h(Note, { tone: "warn", title: "Read-only dashboard" }, READONLY_MESSAGE) : null,
       screen === "chat" ? h("div", { className: "ht-chat" },
         h(TeamRail, {
           teams: teams || [], selected: selected,
-          onSelect: selectTeam, onReload: reloadAll,
+          onSelect: selectTeam,
         }),
         teamsError && !teams
           ? h(ErrorNote, { error: teamsError, what: "The registry", onRetry: reloadAll })
