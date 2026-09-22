@@ -41,7 +41,9 @@ table; each is also commented at its use site:
   ``hermes_cli.kanban_db_connect``, ``hermes_cli.projects_db``,
   ``hermes_cli.profiles``, ``hermes_cli.config``, ``hermes_constants``,
   ``utils`` (modern paths; no re-export shims, no name imported through
-  ``profiles``/``profile_distribution``'s PLUGIN-COMPAT blocks).
+  ``profiles``/``profile_distribution``'s PLUGIN-COMPAT blocks). A
+  profile's session DB is read with raw read-only sqlite
+  (:func:`_session_tokens`), never through ``hermes_state``.
 
 Every read validates and degrades — a dangling member yields
 ``{"exists": false, "managed": false}`` (§4.3), never an exception.
@@ -1116,6 +1118,138 @@ def merge_result(team: "model.Team", card_id: str, *, apply: bool = False) -> di
             hint="The workdir must be a git repo the plugin can read and "
                  "fast-forward.",
             remedy=f"hermes team merge {team.slug} {card_id} --apply") from exc
+
+
+# ── finished-thread report ──────────────────────────────────────────────────
+
+# The dispatcher's prompt to every worker; a compression child session has
+# no prompt of its own and inherits its parent's card.
+_WORKER_PROMPT_RE = re.compile(r"\s*work kanban task (t_[0-9a-f]+)\b")
+_STEP_RE = re.compile(r"\bstep (\d+)\b", re.IGNORECASE)
+
+
+def _session_tokens(profile: str, task_ids, since: float) -> Optional[dict]:
+    """``{task_id: [tokens_in, tokens_out]}`` summed over *profile*'s kanban
+    worker sessions for *task_ids* started at or after *since*, or None when
+    the profile's session DB cannot be read. Opened ``mode=ro``: the reader
+    never creates or migrates a profile's ``state.db``."""
+    import sqlite3
+    try:
+        path = profile_home(profile) / "state.db"
+    except Exception:  # noqa: BLE001 — an unknown profile has no sessions
+        return None
+    if not path.is_file():
+        return None
+    try:
+        conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=1.0)
+        try:
+            rows = conn.execute(
+                "SELECT s.id, s.parent_session_id, s.input_tokens, s.output_tokens,"
+                " (SELECT m.content FROM messages m WHERE m.session_id = s.id"
+                "  AND m.role = 'user' ORDER BY m.id LIMIT 1)"
+                " FROM sessions s WHERE s.source = 'kanban' AND s.started_at >= ?"
+                " ORDER BY s.started_at, s.id", (since,)).fetchall()
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        return None
+    wanted = set(task_ids)
+    owner: dict = {}
+    out: dict = {}
+    for sid, parent, tokens_in, tokens_out, prompt in rows:
+        task = owner.get(parent) if parent else None
+        if task is None:
+            m = _WORKER_PROMPT_RE.match(str(prompt or ""))
+            task = m.group(1) if m else None
+        owner[sid] = task
+        if task in wanted:
+            sums = out.setdefault(task, [0, 0])
+            sums[0] += tokens_in or 0
+            sums[1] += tokens_out or 0
+    return out
+
+
+def thread_report(team: "model.Team", card_id: str) -> dict:
+    """What happened on the thread *card_id* belongs to: per card, who worked
+    it, who reviewed it, how long each attempt ran and the tokens its workers
+    spent.
+
+    A review run is one claimed out of the ``review`` lane (the test
+    ``approvals._is_reviewer_run`` makes); every other run is work. A
+    zero-length run is a re-queue, not an attempt, and is left out. Tokens are
+    None for a card whose workers' session DBs hold nothing readable for it.
+    Read-only: the board and every profile's session DB are only read."""
+    import time
+    root_id, tasks = thread_of(team, card_id)
+    kb = _kb()
+    runs: dict = {}
+    review_runs: set = set()
+    db_path = _board_db(team.board)
+    if db_path is not None:
+        try:
+            with _kanban_conn().connect_closing(db_path=db_path) as conn:
+                for t in tasks:
+                    runs[t.id] = kb.list_runs(conn, t.id)
+                    for e in kb.list_events(conn, t.id):
+                        if e.kind == "claimed" and e.run_id is not None \
+                                and _event_payload(e.payload).get("source_status") == "review":
+                            review_runs.add(e.run_id)
+        except Exception:  # noqa: BLE001 — an unreadable board reads as no runs
+            runs, review_runs = {}, set()
+
+    now = int(time.time())
+    cards = []
+    for t in tasks:
+        work, review = [], []
+        for r in runs.get(t.id, ()):
+            end = now if r.ended_at is None else r.ended_at
+            if r.ended_at is not None and end <= r.started_at:
+                continue
+            (review if r.id in review_runs else work).append((r, end - r.started_at))
+        step = _STEP_RE.search(t.title or "")
+        cards.append({
+            "id": t.id, "title": t.title, "status": t.status,
+            "step": int(step.group(1)) if step else None,
+            "implementer": list(dict.fromkeys(r.profile for r, _ in work if r.profile)),
+            "reviewer": list(dict.fromkeys(r.profile for r, _ in review if r.profile)),
+            "changes": sum(1 for r, _ in review if r.outcome == "changes_requested"),
+            "work_seconds": sum(s for _, s in work),
+            "review_seconds": sum(s for _, s in review),
+            "attempts": [{"outcome": r.outcome, "seconds": s} for r, s in work],
+            "tokens_in": None, "tokens_out": None,
+        })
+
+    all_runs = [r for rs in runs.values() for r in rs]
+    started = min((r.started_at for r in all_runs), default=None)
+    ended = max((r.ended_at for r in all_runs if r.ended_at), default=None)
+    by_id = {c["id"]: c for c in cards}
+    if started is not None:
+        for profile in dict.fromkeys(r.profile for r in all_runs if r.profile):
+            # Sessions start a moment after their run is claimed; the slack
+            # only has to cover clock skew, not a whole run.
+            got = _session_tokens(profile, by_id, started - 60) or {}
+            for tid, (tokens_in, tokens_out) in got.items():
+                card = by_id[tid]
+                card["tokens_in"] = (card["tokens_in"] or 0) + tokens_in
+                card["tokens_out"] = (card["tokens_out"] or 0) + tokens_out
+
+    def total(key):
+        vals = [c[key] for c in cards if c[key] is not None]
+        return sum(vals) if vals else None
+
+    root = next(t for t in tasks if t.id == root_id)
+    return {
+        "team": team.slug, "root": root_id, "title": root.title,
+        "finished": all(t.status == "done" for t in tasks),
+        "started_at": started, "ended_at": ended, "cards": cards,
+        "totals": {
+            "cards": len(cards),
+            "reviewed": sum(1 for c in cards if c["reviewer"]),
+            "work_seconds": total("work_seconds"),
+            "review_seconds": total("review_seconds"),
+            "tokens_in": total("tokens_in"), "tokens_out": total("tokens_out"),
+        },
+    }
 
 
 # ── S10a read seam: the profile's installed skills (deviation 8) ───────────

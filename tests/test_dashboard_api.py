@@ -1794,3 +1794,19 @@ def test_merge_preview_is_a_read_and_apply_a_guarded_write(client, world,
     assert r.json()["data"]["merged"] is True
     assert th.git("rev-parse", "HEAD") == th.git("rev-parse", "wt/step2")
 
+
+def test_thread_report_reads_the_whole_thread(client, world, result_thread):
+    th = result_thread(pathlib.Path(_TMP_ROOT[0]) / "work-rp", "rp", "rp")
+    storage.upsert(model.Team.from_dict({
+        "slug": "rp", "board": "rp", "workdir": str(th.workdir),
+        "orchestrator": "lead",
+        "members": [{"profile": "lead", "role": "orchestrator", "primary": True}]}))
+    r = client.get(f"{P}/teams/rp/tasks/{th.ids['step2']}/report")
+    assert r.status_code == 200, r.text
+    d = r.json()["data"]
+    assert d["root"] == th.ids["root"] and d["finished"] is True
+    assert [c["id"] for c in d["cards"]][0] == th.ids["root"]
+    assert d["totals"]["cards"] == 4 and d["totals"]["tokens_in"] is None
+    assert client.get(f"{P}/teams/rp/tasks/t_nope/report").status_code == 404
+    assert client.get(f"{P}/teams/nope/tasks/{th.ids['root']}/report").status_code == 404
+

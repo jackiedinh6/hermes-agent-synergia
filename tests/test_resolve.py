@@ -201,6 +201,128 @@ def test_merge_result_only_fast_forwards_a_clean_checkout(world, result_thread,
     assert (world.workdir / "README.md").read_text() == "operator\n"
 
 
+
+# ── thread_report: what happened on a finished thread ───────────────────────
+
+def _report_thread(board, tenant):
+    """root → impl (step 1) → step 2, all done. impl crashed once, was
+    re-queued for zero seconds, then went through one round of changes with
+    qa; step 2 was never reviewed. Returns ``{name: card id}``."""
+    import json
+    from hermes_cli import kanban_db, kanban_db_connect
+    # (name, parent, task start, [(run profile, start, end, outcome, review?)])
+    plan = [
+        ("build it", None, 100, [("proj-be", 100, 160, "completed", False)]),
+        ("impl (design step 1)", "build it", 1000, [
+            ("proj-be", 1000, 1600, "crashed", False),
+            ("proj-be", 1600, 1600, "scheduled", False),
+            ("proj-be", 1700, 2900, "review_requested", False),
+            ("qa", 3000, 3300, "changes_requested", True),
+            ("proj-be", 3400, 3700, "review_requested", False),
+            ("qa", 3800, 3920, "completed", True)]),
+        ("wire it (design step 2)", "impl (design step 1)", 4000,
+         [("proj-be", 4000, 4600, "completed", False)]),
+    ]
+    ids: dict = {}
+    with kanban_db_connect.connect_closing(
+            db_path=kanban_db.kanban_db_path(board)) as conn:
+        for n, (name, parent, start, runs) in enumerate(plan):
+            tid = kanban_db.create_task(
+                conn, title=name, tenant=tenant,
+                parents=[ids[parent]] if parent else [],
+                initial_status="running", board=board)
+            conn.execute(
+                "UPDATE tasks SET status = 'done', created_at = ?, started_at = ?, "
+                "completed_at = ? WHERE id = ?", (n + 1, start, runs[-1][2], tid))
+            for profile, begin, end, outcome, review in runs:
+                run_id = conn.execute(
+                    "INSERT INTO task_runs (task_id, profile, status, started_at, "
+                    "ended_at, outcome) VALUES (?, ?, 'done', ?, ?, ?)",
+                    (tid, profile, begin, end, outcome)).lastrowid
+                conn.execute(
+                    "INSERT INTO task_events (task_id, run_id, kind, payload, "
+                    "created_at) VALUES (?, ?, 'claimed', ?, ?)",
+                    (tid, run_id, json.dumps(
+                        {"source_status": "review"} if review else {}), begin))
+            conn.commit()
+            ids[name] = tid
+    return ids
+
+
+def _worker_sessions(home, rows):
+    """``rows`` = (session id, parent id, started_at, first user message,
+    tokens in, tokens out, source) in *home*'s own ``state.db``."""
+    from hermes_state import SessionDB
+    db = SessionDB(db_path=home / "state.db")
+    try:
+        for sid, parent, started, text, tokens_in, tokens_out, source in rows:
+            db.create_session(sid, source)
+            if text:
+                db.append_message(sid, "user", text, timestamp=started)
+            with db._lock:
+                db._conn.execute(
+                    "UPDATE sessions SET parent_session_id = ?, started_at = ?, "
+                    "input_tokens = ?, output_tokens = ? WHERE id = ?",
+                    (parent, started, tokens_in, tokens_out, sid))
+                db._conn.commit()
+    finally:
+        db.close()
+
+
+def test_thread_report_splits_work_from_review(world):
+    ids = _report_thread("proj-board", "proj")
+    r = resolve.thread_report(world.team, ids["wire it (design step 2)"])
+    assert r["root"] == ids["build it"] and r["finished"] is True
+    assert (r["started_at"], r["ended_at"]) == (100, 4600)
+    root, impl, wire = r["cards"]
+    assert [c["id"] for c in r["cards"]] == [ids["build it"], ids["impl (design step 1)"],
+                                            ids["wire it (design step 2)"]]
+    assert (root["step"], impl["step"], wire["step"]) == (None, 1, 2)
+    assert impl["implementer"] == ["proj-be"] and impl["reviewer"] == ["qa"]
+    assert impl["changes"] == 1
+    # the zero-length re-queue is not an attempt
+    assert impl["attempts"] == [
+        {"outcome": "crashed", "seconds": 600},
+        {"outcome": "review_requested", "seconds": 1200},
+        {"outcome": "review_requested", "seconds": 300}]
+    assert (impl["work_seconds"], impl["review_seconds"]) == (2100, 420)
+    assert wire["reviewer"] == [] and wire["changes"] == 0
+    assert r["totals"] == {"cards": 3, "reviewed": 1, "work_seconds": 2760,
+                           "review_seconds": 420, "tokens_in": None,
+                           "tokens_out": None}
+
+
+def test_thread_report_sums_each_cards_worker_sessions(world):
+    ids = _report_thread("proj-board", "proj")
+    impl = ids["impl (design step 1)"]
+    _worker_sessions(world.be, [
+        ("s-root", None, 101.5, f"work kanban task {ids['build it']}", 7, 1, "kanban"),
+        ("s-impl", None, 1001.5, f"work kanban task {impl}", 100, 10, "kanban"),
+        # a compression rotation: no prompt of its own, same card
+        ("s-impl-2", "s-impl", 1300.0, None, 50, 5, "kanban"),
+        ("s-other", None, 1400.0, "work kanban task t_ffffffff", 999, 999, "kanban"),
+        ("s-chat", None, 1500.0, f"work kanban task {impl}", 999, 999, "cli"),
+        ("s-old", None, 1.0, f"work kanban task {impl}", 999, 999, "kanban"),
+    ])
+    qa_db = world.root / "profiles" / "qa" / "state.db"
+    r = resolve.thread_report(world.team, impl)
+    by_id = {c["id"]: c for c in r["cards"]}
+    assert (by_id[ids["build it"]]["tokens_in"], by_id[ids["build it"]]["tokens_out"]) == (7, 1)
+    assert (by_id[impl]["tokens_in"], by_id[impl]["tokens_out"]) == (150, 15)
+    # no session names it: unknown, not zero
+    assert by_id[ids["wire it (design step 2)"]]["tokens_in"] is None
+    assert (r["totals"]["tokens_in"], r["totals"]["tokens_out"]) == (157, 16)
+    # qa has no session DB and the report never makes one
+    assert not qa_db.exists()
+
+
+def test_thread_report_unknown_card_is_not_found(world):
+    _report_thread("proj-board", "proj")
+    with pytest.raises(TeamError) as ei:
+        resolve.thread_report(world.team, "t_nope")
+    assert ei.value.code == "E_TEAM_NOT_FOUND"
+
+
 # ── member block ────────────────────────────────────────────────────────────
 
 def test_existing_member_full_block(world, monkeypatch):

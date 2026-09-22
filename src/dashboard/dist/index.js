@@ -1589,6 +1589,7 @@
   //   POST /teams/{slug}/tasks/{id}/approve|reject  answer a parked one
   //   POST /teams/{slug}/tasks/{root}/pause|resume  park / re-queue the thread
   //   GET|POST /teams/{slug}/tasks/{root}/merge    the thread's result branch
+  //   GET  /teams/{slug}/tasks/{root}/report        what happened, once finished
   // ═══════════════════════════════════════════════════════════════════════════
 
   const THREAD_LIVE_MS = 1000;      // work is moving — the operator is watching
@@ -2477,6 +2478,118 @@
     return !!root && root.total > 0 && root.done === root.total;
   }
 
+  function fmtMinutes(seconds) {
+    const s = Math.max(0, Number(seconds || 0));
+    if (s < 60) return "<1 min";
+    if (s < 90 * 60) return Math.round(s / 60) + " min";
+    const m = Math.round(s / 60);
+    return Math.floor(m / 60) + "h " + (m % 60) + "m";
+  }
+
+  function fmtTokens(n) {
+    if (n === null || n === undefined) return "—";
+    if (n < 1000) return String(n);
+    if (n < 1e6) return Number((n / 1e3).toPrecision(3)) + "k";
+    return Number((n / 1e6).toPrecision(3)) + "M";
+  }
+
+  // A run that ends by handing the card on is plain time; any other ending
+  // is named, so a crash or a pause is visible where the minutes are.
+  const HANDOFF_OUTCOMES = { completed: true, review_requested: true };
+  const ATTEMPT_LABELS = {
+    crashed: "crashed", timed_out: "timed out", scheduled: "paused",
+    blocked: "blocked", gave_up: "gave up", reclaimed: "reclaimed",
+    spawn_failed: "failed to start",
+  };
+
+  function runTimeOf(card) {
+    const attempts = card.attempts || [];
+    if (attempts.every(function (a) { return HANDOFF_OUTCOMES[a.outcome]; })) {
+      return fmtMinutes(card.work_seconds);
+    }
+    return attempts.map(function (a, i) {
+      const time = fmtMinutes(a.seconds);
+      const text = HANDOFF_OUTCOMES[a.outcome] ? time
+        : !a.outcome ? "running for " + time
+        : (ATTEMPT_LABELS[a.outcome] || a.outcome) + " after " + time;
+      return (i && i === attempts.length - 1 ? "then " : "") + text;
+    }).join(", ");
+  }
+
+  function reviewOf(card, slug) {
+    if (!(card.reviewer || []).length) return h("strong", null, "no");
+    const who = card.reviewer.map(function (p) { return shortProfile(p, slug); }).join(", ");
+    if (!card.changes) return who;
+    return who + ", " + (card.changes === 1 ? "one round" : card.changes + " rounds") + " of changes";
+  }
+
+  function TokenCell(props) {
+    const n = props.value;
+    return h("td", { className: "ht-num", title: n === null || n === undefined ? undefined : n.toLocaleString() },
+      fmtTokens(n));
+  }
+
+  // Once every card is done: who worked each card, whether anyone reviewed
+  // it, how long it took and what it cost. One fetch per thread refresh; a
+  // finished thread's numbers do not move.
+  function ThreadReport(props) {
+    const path = "/teams/" + encodeURIComponent(props.slug) + "/tasks/" +
+      encodeURIComponent(props.rootId) + "/report";
+    const poll = usePoll(path, false, [props.refreshKey]);
+    const r = poll.data;
+    if (poll.error && (!r || r.root !== props.rootId)) {
+      return h(ErrorNote, { error: poll.error, what: "The thread report" });
+    }
+    if (!r || r.root !== props.rootId || !(r.cards || []).length) return null;
+
+    const t = r.totals || {};
+    const code = function (text) { return h("code", { className: "ht-code" }, text); };
+    const wall = r.started_at && r.ended_at ? fmtMinutes(r.ended_at - r.started_at) : null;
+    const lead = "The thread finished" + (wall ? " in " + wall : "") + ": " +
+      t.cards + (t.cards === 1 ? " card, " : " cards, ") +
+      fmtMinutes(t.work_seconds) + " of agent work, " +
+      t.reviewed + " of " + t.cards + " reviewed." +
+      (t.tokens_in === null || t.tokens_in === undefined ? "" :
+        " Tokens: " + fmtTokens(t.tokens_in) + " in, " + fmtTokens(t.tokens_out) + " out.");
+
+    return h("div", { className: "ht-note ht-note-ok ht-report" },
+      h("p", { className: "ht-report-lead" }, lead),
+      h("details", { open: true },
+        h("summary", null, h("strong", null, "What happened")),
+        h("div", { className: "ht-table-wrap" },
+          h("table", { className: "ht-table" },
+            h("thead", null, h("tr", null,
+              h("th", null, "Card"), h("th", null, "Implementer"),
+              h("th", null, "Review"), h("th", null, "Run time"),
+              h("th", { className: "ht-num" }, "Tokens in"),
+              h("th", { className: "ht-num" }, "Tokens out"))),
+            h("tbody", null,
+              r.cards.map(function (c) {
+                const who = (c.implementer || []).map(function (p) { return shortProfile(p, props.slug); });
+                return h("tr", { key: c.id },
+                  h("td", { title: c.title }, c.step ? "step " + c.step : c.title, " ", code(c.id)),
+                  h("td", null, who.length ? who.join(", ") : h(Muted, null, "—")),
+                  h("td", null, reviewOf(c, props.slug)),
+                  h("td", null, runTimeOf(c),
+                    c.review_seconds ? h("div", { className: "ht-hint" },
+                      "+ " + fmtMinutes(c.review_seconds) + " review") : null),
+                  h(TokenCell, { value: c.tokens_in }),
+                  h(TokenCell, { value: c.tokens_out }));
+              }),
+              h("tr", { className: "ht-total" },
+                h("td", null, "Total"), h("td", null),
+                h("td", null, t.reviewed + " of " + t.cards),
+                h("td", null, fmtMinutes(t.work_seconds),
+                  t.review_seconds ? h("div", { className: "ht-hint" },
+                    "+ " + fmtMinutes(t.review_seconds) + " review") : null),
+                h(TokenCell, { value: t.tokens_in }),
+                h(TokenCell, { value: t.tokens_out })))
+          )
+        )
+      )
+    );
+  }
+
   // A worktree thread's work lands on its own wt/<id> branches, which the
   // substrate never merges. The bar names the thread's result branch and
   // whether the workdir already holds it; approvals.on_completed fast-forwards
@@ -2671,6 +2784,9 @@
           if (verb === "pause") setPinnedRoot(rootId);
           reload();
         },
+      }) : null,
+      tab === "chat" && rootId && finished(roots, rootId) ? h(ThreadReport, {
+        slug: slug, rootId: rootId, refreshKey: refreshKey,
       }) : null,
       tab === "chat" && rootId && finished(roots, rootId) &&
         team.workspace_policy === "worktree" ? h(ResultBar, {

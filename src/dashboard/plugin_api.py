@@ -1163,6 +1163,21 @@ def get_team_task_merge(slug: str, task_id: str):
     return _ok(data)
 
 
+@router.get("/teams/{slug}/tasks/{task_id}/report")
+def get_team_task_report(slug: str, task_id: str):
+    """What happened on the card's thread: per card, who worked and reviewed
+    it, how long each attempt ran and the tokens it cost
+    (:func:`resolve.thread_report`). Writes nothing."""
+    t, err, _reg, _storage = _team_or_404(slug)
+    if err is not None:
+        return err
+    try:
+        data = _mod("resolve").thread_report(t, task_id)
+    except Exception as exc:                                # noqa: BLE001
+        return _team_err(exc)
+    return _ok(data)
+
+
 @router.post("/teams/{slug}/tasks/{task_id}/merge")
 async def post_team_task_merge(request: Request, slug: str, task_id: str):
     """``{}`` — ``hermes team merge --apply``: fast-forward the workdir's
