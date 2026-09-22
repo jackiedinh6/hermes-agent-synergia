@@ -384,6 +384,19 @@ def test_task_events_payload_is_trimmed_to_the_whitelist(world):
     assert "workspace_path" not in created["payload"]
 
 
+def test_task_events_say_when_a_run_is_a_review(world):
+    """The dashboard offers Pause per running card, and approvals.pause skips
+    a reviewer run — the thread payload has to tell the two apart."""
+    from hermes_cli import kanban_db as kb
+    tid = _carded("proj-board", "reviewed")
+    with resolve._kanban_conn().connect_closing(board="proj-board") as conn:
+        assert kb.request_review(conn, tid, summary="ready", force=True)
+        assert kb.claim_review_task(conn, tid)
+    claimed = [e for e in resolve.task_events("proj-board", [tid])[tid]
+               if e["kind"] == "claimed"]
+    assert claimed[-1]["payload"]["source_status"] == "review"
+
+
 def test_task_events_keep_the_newest_within_the_cap(world):
     from hermes_cli import kanban_db as kb
     tid = _carded("proj-board", "chatty")

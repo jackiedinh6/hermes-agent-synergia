@@ -657,7 +657,7 @@ _EVENT_KINDS = ("created", "dependency_wait", "scheduled", "promoted",
 # card's body, result, skills and metadata. Only the keys that name a lane or
 # explain a transition travel, each truncated.
 _EVENT_KEYS = ("status", "reason", "parent", "assignee", "actor", "kind",
-               "outcome", "filename")
+               "outcome", "filename", "source_status")
 _EVENT_TEXT_MAX = 200
 _EVENTS_MAX = 100
 

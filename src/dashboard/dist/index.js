@@ -12,10 +12,10 @@
   // Every fetch goes through SDK.fetchJSON so auth works in BOTH dashboard
   // modes (loopback X-Hermes-Session-Token header / gated OAuth cookie).
   // Never read window.__HERMES_SESSION_TOKEN__, never call bare fetch.
-  // fetchJSON rejects non-2xx as Error("<status>: <body text>")
-  // (web/src/lib/api.ts:180-183) — errStatus()/errEnvelope() below parse the
-  // status back off the message so 409 (CAS) and 405 DASHBOARD_READONLY
-  // (dashboard_writes false) get their own, actionable rendering.
+  // fetchJSON rejects non-2xx with an ApiError carrying `status` and the raw
+  // `body` (web/src/lib/api-error.ts; older hosts: Error("<status>: <body>")) —
+  // errStatus()/errEnvelope() below read both shapes so 409 (CAS) and 405
+  // DASHBOARD_READONLY (dashboard_writes false) get their own, actionable rendering.
   //
   // Backend contract: team_plugin/hermes-agent-synergia/dashboard/plugin_api.py.
   // Every path below is one of its router decorators; every body key is one
@@ -216,18 +216,25 @@
     }).then(unwrap);
   }
 
+  function errParts(err) {
+    if (err && typeof err.status === "number" && typeof err.body === "string") {
+      return { status: err.status, body: err.body, legacy: false };
+    }
+    const m = /^(\d{3}):\s*([\s\S]*)$/.exec(String((err && err.message) || err));
+    return m ? { status: Number(m[1]), body: m[2], legacy: true } : null;
+  }
+
   function errStatus(err) {
-    const m = /^(\d{3}):/.exec(String((err && err.message) || err));
-    return m ? Number(m[1]) : null;
+    const parts = errParts(err);
+    return parts && parts.status ? parts.status : null;
   }
 
   function errEnvelope(err) {
-    const raw = String((err && err.message) || err);
-    const m = /^\d{3}:\s*([\s\S]*)$/.exec(raw);
-    if (!m) return null;
+    const parts = errParts(err);
+    if (!parts) return null;
     try {
-      const parsed = JSON.parse(m[1]);
-      if (parsed && parsed.error) return parsed.error;
+      const parsed = JSON.parse(parts.body);
+      if (parsed && parsed.error && typeof parsed.error === "object") return parsed.error;
     } catch (_) { /* non-JSON body */ }
     return null;
   }
@@ -235,9 +242,9 @@
   function errText(err) {
     const env = errEnvelope(err);
     if (env) return String(env.message || env.code || "").trim() || "refused";
-    const raw = String((err && err.message) || err);
-    const m = /^\d{3}:\s*([\s\S]*)$/.exec(raw);
-    return String(m ? m[1] : raw).slice(0, 500);
+    const parts = errParts(err);
+    const raw = parts && parts.legacy ? parts.body : String((err && err.message) || err);
+    return raw.slice(0, 500);
   }
 
   const READONLY_MESSAGE =
@@ -1723,6 +1730,7 @@
     if (kind === "attached") return null;
     if (kind === "dependency_wait") return payload.parent ? "parent " + payload.parent : null;
     if (kind === "created") return payload.status || null;
+    if (kind === "claimed") return payload.source_status === "review" ? "review" : null;
     if (kind === "completed") {
       return task.started_at ? durationOf(task.started_at, task.completed_at) : null;
     }
@@ -1979,13 +1987,27 @@
   // approvals.pause parks these; resume re-queues whatever is `scheduled`.
   const PAUSABLE = { running: true, ready: true, todo: true };
 
+  // approvals.pause skips a reviewer run: a resumed `scheduled` card always
+  // lands in `ready`, which would turn the review into an implementation run.
+  function reviewerRun(task) {
+    if (task.status !== "running") return false;
+    const rows = task.events || [];
+    for (let i = rows.length - 1; i >= 0; i--) {
+      if (rows[i].kind === "claimed") return (rows[i].payload || {}).source_status === "review";
+    }
+    return false;
+  }
+
   function PauseControl(props) {
     const [confirming, setConfirming] = hooks.useState(false);
     const [busy, setBusy] = hooks.useState(false);
     const tasks = props.tasks || [];
-    const canPause = tasks.some(function (task) { return PAUSABLE[task.status]; });
+    const canPause = tasks.some(function (task) {
+      return PAUSABLE[task.status] && !reviewerRun(task);
+    });
+    const reviewing = !canPause && tasks.some(reviewerRun);
     const paused = tasks.some(function (task) { return task.status === "scheduled"; });
-    if (!props.rootId || (!canPause && !paused)) return null;
+    if (!props.rootId || (!canPause && !paused && !reviewing)) return null;
     const path = "/teams/" + encodeURIComponent(props.slug) + "/tasks/" +
       encodeURIComponent(props.rootId) + "/";
 
@@ -2013,6 +2035,12 @@
         size: "sm", outlined: true, disabled: props.readOnly || busy,
         onClick: function () { setConfirming(true); },
       }, "Pause") : null,
+      // A disabled button swallows hover in some browsers, so the reason
+      // rides on a wrapper.
+      reviewing ? h("span", {
+        title: "A review is running and finishes on its own; " +
+          "Pause parks running, ready and todo cards.",
+      }, h(UI.Button, { size: "sm", outlined: true, disabled: true }, "Pause")) : null,
       confirming ? h(UI.ConfirmDialog, {
         open: true,
         destructive: true,
