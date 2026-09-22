@@ -743,10 +743,10 @@ def stop_cards(board: str, ids, reason: str, *, signal_fn=None) -> dict:
     respawn the card before the caller's change lands; an explicit block is
     sticky. Same write-then-kill order as the kanban dashboard's
     ``_set_status_direct``."""
-    stopped, not_killed = [], []
+    stopped = []
     db_path = _board_db(board)
     if db_path is None:
-        return {"stopped": stopped, "not_killed": not_killed}
+        return {"stopped": stopped, "not_killed": []}
     kb = _kb()
     kills = []
     with _kanban_conn().connect_closing(db_path=db_path) as conn:
@@ -759,11 +759,22 @@ def stop_cards(board: str, ids, reason: str, *, signal_fn=None) -> dict:
                 stopped.append(tid)
                 if pid:
                     kills.append((tid, pid, lock))
+    return {"stopped": stopped,
+            "not_killed": terminate_workers(kills, signal_fn=signal_fn)}
+
+
+def terminate_workers(kills, *, signal_fn=None) -> list:
+    """SIGTERM (then SIGKILL) each ``(task_id, pid, claim_lock)`` worker; the
+    ids whose worker could not be killed. Call only after the transition that
+    took the card off ``running`` has committed. Host-local only: a claim lock
+    from another host is never signalled and lands in the returned list."""
+    kb = _kb()
+    not_killed = []
     for tid, pid, lock in kills:
         info = kb._terminate_reclaimed_worker(pid, lock, signal_fn=signal_fn)
         if not info.get("terminated"):
             not_killed.append(tid)
-    return {"stopped": stopped, "not_killed": not_killed}
+    return not_killed
 
 
 def resume_cards(board: str, ids) -> list:

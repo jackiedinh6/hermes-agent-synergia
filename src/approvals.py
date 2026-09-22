@@ -50,6 +50,9 @@ waiting for, and leaving it to an agent run costs a spawn that cannot happen.
 Everywhere else the assignee still resumes, reads the decision and completes
 the card itself.
 
+Pause and resume live here too: they are operator verbs over the same board,
+but act on a whole thread (every card under the root card) instead of one lane.
+
 Substrate calls are lazy imports inside functions (spec §5.2), and only public
 symbols are used (§5.2.1) — ``add_comment`` and ``unblock_task`` append their
 own ``commented``/``unblocked`` events, so no private event writer is touched.
@@ -107,6 +110,11 @@ NOTE_PREFIX = "NOTE"
 # A card the operator may still steer: not finished, not parked on anyone.
 RUNNING_STATUS = "running"
 DONE_STATUS = "done"
+TODO_STATUS = "todo"
+SCHEDULED_STATUS = "scheduled"
+
+PAUSE_REASON = "paused by operator"
+_PAUSABLE_STATUSES = (RUNNING_STATUS, READY_STATUS, TODO_STATUS)
 
 _HEADLINE_MAX = 240
 # Artifact preview cap, same idiom as the dashboard log tail.
@@ -795,15 +803,20 @@ _RELEASE_MOVES = {STUCK: _move_unblock, TRIAGE: _move_specify,
                   GUARDED: _move_clear_guard}
 
 
-def _decide(t, task_id: str, *, body: str, text: str, author, action: str,
-            require, moves=None) -> dict:
-    from hermes_cli import kanban_db
+def _board_or_raise(t):
     ctx = _conn_ctx(t)
     if ctx is None:
         raise TeamError(
             E_TEAM_NOT_FOUND, f"board {t.board!r} has no cards yet",
             hint="The board DB is created on first write.",
             remedy=f"hermes team status {t.slug}")
+    return ctx
+
+
+def _decide(t, task_id: str, *, body: str, text: str, author, action: str,
+            require, moves=None) -> dict:
+    from hermes_cli import kanban_db
+    ctx = _board_or_raise(t)
     author = (author or "").strip() or operator_author()
     with ctx as conn:
         task = _task_or_raise(conn, t, task_id)
@@ -890,6 +903,116 @@ def note(t, task_id: str, text: str, *, author=None) -> dict:
     res["delivery"] = ("mid-run" if res["status"] == RUNNING_STATUS
                        else "next_run")
     return res
+
+
+# ── pause / resume a thread ──────────────────────────────────────────────────
+
+def _thread_ids(t, task_id: str) -> tuple:
+    """``(root_id, [card ids])`` of the thread *task_id* belongs to."""
+    from . import resolve
+    for root_id, group in resolve.task_forest(t.board, tenant_of(t)).items():
+        ids = [task.id for task in group["tasks"]]
+        if task_id in ids:
+            return root_id, ids
+    return task_id, [task_id]
+
+
+def _is_reviewer_run(conn, task_id: str) -> bool:
+    from hermes_cli import kanban_db
+    for event in reversed(kanban_db.list_events(conn, task_id)):
+        if event.kind == "claimed":
+            payload = event.payload if isinstance(event.payload, dict) else {}
+            return payload.get("source_status") == REVIEW_STATUS
+    return False
+
+
+def pause(t, task_id: str, *, signal_fn=None) -> dict:
+    """Park every running, ready and todo card of *task_id*'s thread in
+    ``scheduled`` and kill the running workers; :func:`resume` re-queues them.
+
+    ``schedule_task``, not ``block_task``: every block counts toward
+    ``BLOCK_RECURRENCE_LIMIT``, so the second pause of one card would route it
+    to triage. ``scheduled`` sits in no approvals lane, fires no blocked hook
+    and nothing in the dispatcher promotes it. The worker is killed, not
+    frozen — a frozen worker outlives its claim TTL and is reclaimed anyway —
+    so a resumed card is a fresh run that keeps the workdir and the card's
+    history, not the agent's context.
+
+    A running reviewer run is skipped: ``unblock_task`` resumes a scheduled
+    card to ``ready``, which would turn it into an implementation run.
+    ``review`` cards cannot be scheduled at all, so with
+    ``kanban.review_dispatch`` on one can still be claimed while paused.
+    """
+    from hermes_cli import kanban_db
+    from . import resolve
+    paused, skipped, kills = [], [], []
+    with _board_or_raise(t) as conn:
+        _task_or_raise(conn, t, task_id)
+        root_id, ids = _thread_ids(t, task_id)
+        for tid in ids:
+            task = kanban_db.get_task(conn, tid)
+            if task is None or task.status not in _PAUSABLE_STATUSES:
+                continue
+            if task.status == RUNNING_STATUS and _is_reviewer_run(conn, tid):
+                skipped.append({"id": tid, "reason": "reviewer run"})
+                continue
+            pid, lock = task.worker_pid, task.claim_lock
+            if kanban_db.schedule_task(conn, tid, reason=PAUSE_REASON):
+                paused.append(tid)
+                if pid:
+                    kills.append((tid, pid, lock))
+    if not paused:
+        raise TeamError(
+            E_TEAM_INVALID,
+            f"nothing to pause in thread {root_id}",
+            hint="Pause parks the running, ready and todo cards of a thread; "
+                 "a reviewer run finishes on its own.",
+            remedy=f"hermes team status {t.slug}",
+        )
+    return {
+        "team": t.slug,
+        "board": t.board,
+        "task_id": task_id,
+        "root_id": root_id,
+        "action": "pause",
+        "paused": paused,
+        "skipped": skipped,
+        "not_killed": resolve.terminate_workers(kills, signal_fn=signal_fn),
+    }
+
+
+def resume(t, task_id: str) -> dict:
+    """Re-queue every ``scheduled`` card of *task_id*'s thread.
+    ``unblock_task`` re-gates each on its parents, so a child whose parent is
+    not done lands in ``todo``, not ``ready``."""
+    from hermes_cli import kanban_db
+    resumed, statuses = [], {}
+    with _board_or_raise(t) as conn:
+        _task_or_raise(conn, t, task_id)
+        root_id, ids = _thread_ids(t, task_id)
+        for tid in ids:
+            task = kanban_db.get_task(conn, tid)
+            if task is None or task.status != SCHEDULED_STATUS:
+                continue
+            if kanban_db.unblock_task(conn, tid):
+                resumed.append(tid)
+                statuses[tid] = kanban_db.get_task(conn, tid).status
+    if not resumed:
+        raise TeamError(
+            E_TEAM_INVALID,
+            f"nothing is paused in thread {root_id}",
+            hint="Resume re-queues the cards a pause parked.",
+            remedy=f"hermes team status {t.slug}",
+        )
+    return {
+        "team": t.slug,
+        "board": t.board,
+        "task_id": task_id,
+        "root_id": root_id,
+        "action": "resume",
+        "resumed": resumed,
+        "statuses": statuses,
+    }
 
 
 # ── messenger push (the kanban_task_blocked / dispatch_tick observers) ───────

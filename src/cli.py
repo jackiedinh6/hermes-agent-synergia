@@ -297,6 +297,24 @@ def _setup_parser_impl(p):
                     help="Disambiguate when two teams hold the same card id")
     sp.add_argument("--json", action="store_true")
 
+    sp = subs.add_parser(
+        "pause",
+        help="Pause the card's whole thread: park every running, ready and "
+             "todo card and stop the running workers. Resume starts a fresh "
+             "run; files in the workdir are kept")
+    sp.add_argument("card")
+    sp.add_argument("--team", default=None, metavar="TEAM",
+                    help="Disambiguate when two teams hold the same card id")
+    sp.add_argument("--json", action="store_true")
+
+    sp = subs.add_parser(
+        "resume",
+        help="Re-queue every paused card of the card's thread")
+    sp.add_argument("card")
+    sp.add_argument("--team", default=None, metavar="TEAM",
+                    help="Disambiguate when two teams hold the same card id")
+    sp.add_argument("--json", action="store_true")
+
     sp = subs.add_parser("destroy", help="Delete a team and its managed profiles")
     sp.add_argument("team")
     sp.add_argument("--yes", action="store_true")
@@ -3376,6 +3394,41 @@ def _cmd_note(args) -> int:
     return 0
 
 
+def _pause_lines(res: dict) -> list:
+    lines = [f"paused {len(res['paused'])} card(s) in thread {res['root_id']} "
+             f"({res['team']}): {', '.join(res['paused'])}"]
+    for skip in res["skipped"]:
+        lines.append(f"  left running: {skip['id']} ({skip['reason']})")
+    if res["not_killed"]:
+        lines.append("  worker not stopped (another host, or already gone): "
+                     + ", ".join(res["not_killed"]))
+    lines.append(f"  resume with: hermes team resume {res['task_id']}")
+    return lines
+
+
+def _cmd_pause(args) -> int:
+    from . import approvals
+    reg = storage.load()
+    t, _d = _find_card(args.card, args.team, reg)
+    res = approvals.pause(t, args.card)
+    res["_human"] = _pause_lines(res)
+    _emit(res, json_mode=args.json)
+    return 0
+
+
+def _cmd_resume(args) -> int:
+    from . import approvals
+    reg = storage.load()
+    t, _d = _find_card(args.card, args.team, reg)
+    res = approvals.resume(t, args.card)
+    res["_human"] = (
+        [f"resumed {len(res['resumed'])} card(s) in thread {res['root_id']} "
+         f"({res['team']})"]
+        + [f"  {tid}: {status}" for tid, status in res["statuses"].items()])
+    _emit(res, json_mode=args.json)
+    return 0
+
+
 _COMMANDS = {
     "list": _cmd_list,
     "show": _cmd_show,
@@ -3387,6 +3440,8 @@ _COMMANDS = {
     "reject": _cmd_reject,
     "release": _cmd_release,
     "note": _cmd_note,
+    "pause": _cmd_pause,
+    "resume": _cmd_resume,
     "destroy": _cmd_destroy,
     "add-member": _cmd_add_member,
     "remove-member": _cmd_remove_member,
@@ -3407,7 +3462,8 @@ def handle(args) -> int:
     cmd = getattr(args, "team_command", None)
     if cmd is None:
         print("usage: hermes team {list,show,create,adopt,status,approvals,"
-              "approve,reject,release,destroy,add-member,remove-member,doctor,"
+              "approve,reject,release,note,pause,resume,destroy,add-member,"
+              "remove-member,doctor,"
               "profiles,recipes,sync,set-board,set-workdir,clone,export,"
               "import} ...",
               file=sys.stderr)

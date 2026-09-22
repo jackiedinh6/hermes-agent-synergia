@@ -1663,6 +1663,37 @@ def test_task_tree_events_and_comments_are_independent(client, steerable):
     assert "commented" not in [e["kind"] for e in row["events"]]
 
 
+# ── pausing a thread: POST …/pause and …/resume ─────────────────────────────
+
+def test_pause_needs_the_confirm_token_because_it_kills_a_worker(client, steerable):
+    r = client.post(f"{P}/teams/px/tasks/{steerable}/pause", json={})
+    assert r.status_code == 400
+    assert r.json()["error"]["code"] == "E_TEAM_INVALID"
+    assert _task_row(None, "px", steerable)["status"] == "running"
+
+
+def test_pause_then_resume_round_trips_the_thread(client, steerable):
+    r = client.post(f"{P}/teams/px/tasks/{steerable}/pause",
+                    json={"confirm": steerable})
+    assert r.status_code == 200, r.text
+    assert r.json()["data"]["paused"] == [steerable]
+    assert _task_row(None, "px", steerable)["status"] == "scheduled"
+    r = client.post(f"{P}/teams/px/tasks/{steerable}/resume", json={})
+    assert r.status_code == 200, r.text
+    assert r.json()["data"]["statuses"] == {steerable: "ready"}
+    assert _task_row(None, "px", steerable)["status"] == "ready"
+
+
+def test_pause_and_resume_are_405_when_the_dashboard_is_read_only(
+        client, world, steerable):
+    _writes_off(world)
+    assert client.post(f"{P}/teams/px/tasks/{steerable}/pause",
+                       json={"confirm": steerable}).status_code == 405
+    assert client.post(f"{P}/teams/px/tasks/{steerable}/resume",
+                       json={}).status_code == 405
+    assert _task_row(None, "px", steerable)["status"] == "running"
+
+
 # ── the three lanes the substrate parks silently ─────────────────────────────
 #
 # Regression for the Release button that "did nothing": the card it released

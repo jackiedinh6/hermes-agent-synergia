@@ -1546,8 +1546,13 @@
     };
   }
 
+  // `scheduled` is the substrate's word; approvals.pause is the only thing on a
+  // team board that puts a card there.
+  const STATUS_LABELS = { scheduled: "paused" };
+
   function StatusChip(props) {
-    return h("span", { className: cn("ht-status", "ht-lane-" + props.status) }, props.status || "—");
+    return h("span", { className: cn("ht-status", "ht-lane-" + props.status) },
+      STATUS_LABELS[props.status] || props.status || "—");
   }
 
   function AssigneeChip(props) {
@@ -1568,13 +1573,14 @@
   }
 
   // ═══════════════════════════════════════════════════════════════════════════
-  // Chat — the product surface. One team, one thread, four routes:
+  // Chat — the product surface. One team, one thread, these routes:
   //   GET  /teams/{slug}/status                     lanes + started tasks
   //   GET  /teams/{slug}/tasks/{root}?comments=true the thread itself
   //   GET  /teams/{slug}/approvals                  which card wants an answer
   //   POST /teams/{slug}/tasks                      a new card
   //   POST /teams/{slug}/tasks/{id}/note            steer the running card
   //   POST /teams/{slug}/tasks/{id}/approve|reject  answer a parked one
+  //   POST /teams/{slug}/tasks/{root}/pause|resume  park / re-queue the thread
   // ═══════════════════════════════════════════════════════════════════════════
 
   const THREAD_LIVE_MS = 1000;      // work is moving — the operator is watching
@@ -1610,7 +1616,7 @@
   // Each row is one line in the thread, at the row's own time — which is why a
   // card never changes place once it is on screen: it gains a line instead.
   const EVENT_LABELS = {
-    created: "created", dependency_wait: "waiting", scheduled: "ready",
+    created: "created", dependency_wait: "waiting", scheduled: "paused",
     promoted: "ready", promoted_manual: "ready", claimed: "started",
     reclaimed: "restarted", blocked: "blocked", unblocked: "released",
     review_requested: "in review", review_reopened: "review reopened",
@@ -1618,7 +1624,7 @@
     completed: "done", archived: "archived",
   };
   const EVENT_TONES = {
-    blocked: "warn", changes_requested: "warn",
+    blocked: "warn", changes_requested: "warn", scheduled: "warn",
     completed: "ok", unblocked: "ok",
   };
   // The entries a worker log can hang under — every other transition has no
@@ -1739,6 +1745,7 @@
     // Artifacts open on a click and stay open — keyed by attachment id, which
     // is board-wide, so two cards' files never collide.
     const [artOpen, setArtOpen] = hooks.useState({});
+    const [controlError, setControlError] = hooks.useState(null);
     const scrollRef = hooks.useRef(null);
     const follow = hooks.useRef(true);
 
@@ -1788,7 +1795,10 @@
       if (el && follow.current) el.scrollTop = el.scrollHeight;
     }, [events.length, props.rootId]);
 
-    hooks.useEffect(function () { follow.current = true; }, [props.rootId]);
+    hooks.useEffect(function () {
+      follow.current = true;
+      setControlError(null);
+    }, [props.rootId]);
 
     function logShown(task) {
       const choice = logOpen[task.id];
@@ -1938,8 +1948,19 @@
           h("strong", null, root.title || root.id),
           h(Muted, null, done + "/" + tasks.length + " done")
         ),
-        h(Muted, null, live ? "live · every 1s" : "idle · every 5s")
+        h("div", { className: "ht-row" },
+          h(PauseControl, {
+            slug: props.slug, rootId: props.rootId, tasks: tasks,
+            readOnly: props.readOnly, onReadOnly: props.onReadOnly,
+            onError: setControlError,
+            onDone: function (verb, data) { poll.reload(); props.onPaused(verb, data); },
+          }),
+          h(Muted, null, live ? "live · every 1s" : "idle · every 5s")
+        )
       ) : null,
+      controlError
+        ? h(ErrorNote, { error: controlError, what: "This thread", title: "Not changed" })
+        : null,
       poll.error && run
         ? h(Note, { tone: "warn", title: "Last poll failed" },
             describeError(poll.error, "This task"))
@@ -1953,6 +1974,70 @@
         },
       }, body)
     );
+  }
+
+  // approvals.pause parks these; resume re-queues whatever is `scheduled`.
+  const PAUSABLE = { running: true, ready: true, todo: true };
+
+  function PauseControl(props) {
+    const [confirming, setConfirming] = hooks.useState(false);
+    const [busy, setBusy] = hooks.useState(false);
+    const tasks = props.tasks || [];
+    const canPause = tasks.some(function (task) { return PAUSABLE[task.status]; });
+    const paused = tasks.some(function (task) { return task.status === "scheduled"; });
+    if (!props.rootId || (!canPause && !paused)) return null;
+    const path = "/teams/" + encodeURIComponent(props.slug) + "/tasks/" +
+      encodeURIComponent(props.rootId) + "/";
+
+    function send(verb, body) {
+      setBusy(true);
+      props.onError(null);
+      apiSend("POST", path + verb, body).then(function (data) {
+        setBusy(false);
+        setConfirming(false);
+        props.onDone(verb, data || {});
+      }, function (err) {
+        setBusy(false);
+        setConfirming(false);
+        props.onError(err);
+        if (isReadOnly(err)) props.onReadOnly();
+      });
+    }
+
+    return h("div", { className: "ht-row" },
+      paused ? h(UI.Button, {
+        size: "sm", disabled: props.readOnly || busy,
+        onClick: function () { send("resume", {}); },
+      }, "Resume") : null,
+      canPause ? h(UI.Button, {
+        size: "sm", outlined: true, disabled: props.readOnly || busy,
+        onClick: function () { setConfirming(true); },
+      }, "Pause") : null,
+      confirming ? h(UI.ConfirmDialog, {
+        open: true,
+        destructive: true,
+        title: "Pause this thread?",
+        description: "Every running, ready and todo card of the thread is parked and " +
+          "running workers are stopped, so the agent's in-progress context is lost. " +
+          "Resume starts a fresh run over the same workdir and the card's history.",
+        confirmLabel: "Pause",
+        loading: busy,
+        onCancel: function () { setConfirming(false); },
+        // confirm == root id, the same token the other destructive verbs use.
+        onConfirm: function () { send("pause", { confirm: props.rootId }); },
+      }) : null
+    );
+  }
+
+  function pausedMessage(verb, data) {
+    if (verb === "resume") {
+      return "Resumed " + (data.resumed || []).length + " card(s).";
+    }
+    const skipped = (data.skipped || []).length;
+    const notKilled = (data.not_killed || []).length;
+    return "Paused " + (data.paused || []).length + " card(s)." +
+      (skipped ? " " + skipped + " reviewer run(s) left running." : "") +
+      (notKilled ? " " + notKilled + " worker(s) could not be stopped from this host." : "");
   }
 
   const COMPOSER_MODES = {
@@ -2148,17 +2233,20 @@
     );
   }
 
+  // A board column, not a count: resolve.COUNT_STATUSES stays the frozen six.
+  const BOARD_LANES = LANES.concat(["scheduled"]);
+
   function KanbanBoard(props) {
     const byLane = {};
-    LANES.forEach(function (lane) { byLane[lane] = []; });
+    BOARD_LANES.forEach(function (lane) { byLane[lane] = []; });
     (props.tasks || []).forEach(function (task) {
       if (byLane[task.status]) byLane[task.status].push(task);
     });
-    return h("div", { className: "ht-board" }, LANES.map(function (lane) {
+    return h("div", { className: "ht-board" }, BOARD_LANES.map(function (lane) {
       const rows = byLane[lane];
       return h("div", { key: lane, className: cn("ht-board-col", "ht-lane-" + lane) },
         h("div", { className: "ht-board-head" },
-          h("span", { className: "ht-lane-name" }, lane),
+          h("span", { className: "ht-lane-name" }, STATUS_LABELS[lane] || lane),
           h("span", { className: "ht-lane-count" }, rows.length)
         ),
         rows.length ? null : h("p", { className: "ht-hint" }, "—"),
@@ -2264,7 +2352,7 @@
 
     // The thread follows the work unless the operator pinned one: the card
     // that is running, else the one parked on a human, else the newest start.
-    const RANK = { running: 0, blocked: 1, review: 2, ready: 3, todo: 4 };
+    const RANK = { running: 0, blocked: 1, review: 2, ready: 3, todo: 4, scheduled: 5 };
     let liveRoot = null;
     let liveRank = 99;
     tasks.forEach(function (task) {
@@ -2335,6 +2423,14 @@
         : null,
       tab === "chat" ? h(ChatThread, {
         slug: slug, rootId: rootId, refreshKey: refreshKey,
+        readOnly: props.readOnly, onReadOnly: props.onReadOnly,
+        // A paused thread would lose the follow to any live one, so the
+        // operator's own pause pins it.
+        onPaused: function (verb, data) {
+          props.onToast(pausedMessage(verb, data));
+          if (verb === "pause") setPinnedRoot(rootId);
+          reload();
+        },
       }) : null,
       // The decision lives where the work is read: the same ApprovalCard the
       // inbox draws, so the artifacts, the block reason and the verbs are all

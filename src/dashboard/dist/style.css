@@ -144,6 +144,7 @@
 .ht-lane-review { --ht-lane: #f59e0b; }
 .ht-lane-done { --ht-lane: #22c55e; }
 .ht-lane-blocked { --ht-lane: #ef4444; }
+.ht-lane-scheduled { --ht-lane: #f97316; }
 
 /* ── role chips ───────────────────────────────────────────────────────── */
 .ht-chips { display: flex; flex-wrap: wrap; gap: .3rem; }
@@ -595,9 +596,9 @@
   padding: .45rem .55rem; font: inherit; font-size: .84rem; line-height: 1.45;
 }
 
-/* ── kanban — six read-only lanes ─────────────────────────────────────── */
+/* ── kanban — six read-only lanes, plus paused ────────────────────────── */
 .ht-board {
-  display: grid; grid-template-columns: repeat(6, minmax(11rem, 1fr));
+  display: grid; grid-template-columns: repeat(7, minmax(11rem, 1fr));
   gap: .5rem; overflow-x: auto; align-items: start;
 }
 .ht-board-col {

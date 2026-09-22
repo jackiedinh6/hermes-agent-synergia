@@ -686,6 +686,21 @@ def _run_checks_inner(results: list, root: Path) -> None:
         return "40-char ─ turn-start rule agrees with worker_exit_guard.MARKER"
     check(results, "turn-start marker agrees with the guard", c_turn_marker)
 
+    # 50. Pause parks a thread in `scheduled` (no block, so no recurrence
+    #     count toward triage), kills the worker after the commit, and resume
+    #     is unblock_task, which accepts `scheduled`.
+    def c_pause_surface():
+        if "scheduled" not in kb.VALID_STATUSES:
+            raise AssertionError(
+                f"scheduled gone from VALID_STATUSES: {sorted(kb.VALID_STATUSES)}")
+        _callable_attr(kb, "schedule_task")
+        _callable_attr(kb, "unblock_task")
+        _callable_attr(kb, "_terminate_reclaimed_worker")
+        return (_kwargs_ok(kb.schedule_task, ["reason"]) + "; "
+                + _kwargs_ok(kb._terminate_reclaimed_worker, ["signal_fn"])
+                + "; scheduled ∈ VALID_STATUSES")
+    check(results, "pause/resume surface (schedule_task, worker kill)", c_pause_surface)
+
     # ---- notices: printed, never asserted (Do.8, Do.13) ----
 
     # Compat-window operator notice (Do.8).

@@ -1103,6 +1103,48 @@ async def post_team_task_note(request: Request, slug: str, task_id: str):
     return _ok(payload)
 
 
+async def _thread_route(request: Request, slug: str, task_id: str,
+                        *, action: str):
+    approvals = _mod("approvals")
+    guard = _mutation_guard(request)
+    if guard is not None:
+        return guard
+    body = await _body(request)
+    if isinstance(body, JSONResponse):
+        return body
+    t, err, _reg, _storage = _team_or_404(slug)
+    if err is not None:
+        return err
+    if action == "pause":
+        refusal = _confirm(body, task_id, f"pause of the thread of {task_id}")
+        if refusal is not None:
+            return refusal
+    verb = approvals.pause if action == "pause" else approvals.resume
+    try:
+        payload = await _thread(lambda: verb(t, task_id))
+    except Exception as exc:                                # noqa: BLE001
+        return _team_err(exc)
+    return _ok(payload)
+
+
+@router.post("/teams/{slug}/tasks/{task_id}/pause")
+async def post_team_task_pause(request: Request, slug: str, task_id: str):
+    """``{confirm: "<task_id>"}`` — park every running, ready and todo card of
+    the card's thread and stop the running workers.
+
+    Confirmed because it kills a worker: the agent's in-process context is
+    lost and resume starts a fresh run over the same workdir.
+    """
+    return await _thread_route(request, slug, task_id, action="pause")
+
+
+@router.post("/teams/{slug}/tasks/{task_id}/resume")
+async def post_team_task_resume(request: Request, slug: str, task_id: str):
+    """``{}`` — re-queue every paused card of the card's thread. No
+    ``confirm``: it only puts cards back in the pool."""
+    return await _thread_route(request, slug, task_id, action="resume")
+
+
 @router.get("/teams/{slug}/drift")
 def get_team_drift(slug: str):
     reconcile = _mod("reconcile")

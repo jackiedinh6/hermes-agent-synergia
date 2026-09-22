@@ -983,3 +983,122 @@ def test_check_review_loop_is_a_no_op_below_the_cap_and_when_disabled(alpha):
     _review_rounds("alpha", tid, 5)
     assert approvals.check_review_loop([tid], "alpha", limit=0)["parked"] == []
     assert _status_of("alpha", tid)[0] != "blocked"
+
+
+# ── pausing a thread ─────────────────────────────────────────────────────────
+#
+# Pause parks with schedule_task, never block_task: every block counts toward
+# BLOCK_RECURRENCE_LIMIT, so the second pause of one card would have routed it
+# to triage.
+
+@pytest.fixture
+def worker():
+    """A live host-local 'worker' process and a claim lock that owns it."""
+    import subprocess
+    from hermes_cli import kanban_db
+    proc = subprocess.Popen(["sleep", "60"])
+    yield proc, kanban_db._host_prefix() + "pause-test"
+    if proc.poll() is None:
+        proc.kill()
+    proc.wait(timeout=5)
+
+
+@pytest.fixture
+def thread(alpha, worker):
+    """A root card running under a real claim with a live worker, a card its
+    worker created (ready), a child gated on the root (todo), and an unrelated
+    ready card on the same board."""
+    from hermes_cli import kanban_db
+    proc, lock = worker
+    root = _card("alpha", tenant="alpha", title="build the tracker")
+    with _conn("alpha") as conn:
+        assert kanban_db.claim_task(conn, root, claimer=lock)
+        conn.execute("UPDATE tasks SET worker_pid = ? WHERE id = ?",
+                     (proc.pid, root))
+        conn.commit()
+        spawned = kanban_db.create_task(
+            conn, title="research", assignee="lead", tenant="alpha",
+            creator_task_id=root, board="alpha")
+        child = kanban_db.create_task(
+            conn, title="write it up", assignee="lead", tenant="alpha",
+            parents=[root], board="alpha")
+    return {"root": root, "spawned": spawned, "child": child,
+            "other": alpha["open"], "proc": proc}
+
+
+def _team_alpha():
+    return storage.load().teams["alpha"]
+
+
+def test_pause_parks_every_open_card_of_the_thread_and_kills_the_worker(thread):
+    res = approvals.pause(_team_alpha(), thread["child"])
+    assert res["root_id"] == thread["root"]
+    assert sorted(res["paused"]) == sorted(
+        [thread["root"], thread["spawned"], thread["child"]])
+    assert res["not_killed"] == [] and res["skipped"] == []
+    for tid in res["paused"]:
+        assert _status_of("alpha", tid)[0] == "scheduled"
+    assert _status_of("alpha", thread["other"])[0] == "ready"
+    assert thread["proc"].wait(timeout=5) is not None
+
+
+def test_resume_requeues_the_thread_and_regates_on_parents(thread):
+    t = _team_alpha()
+    approvals.pause(t, thread["root"])
+    res = approvals.resume(t, thread["root"])
+    assert res["statuses"] == {thread["root"]: "ready",
+                               thread["spawned"]: "ready",
+                               thread["child"]: "todo"}
+
+
+def test_repeated_pause_never_routes_a_card_to_triage(thread):
+    t = _team_alpha()
+    for _ in range(4):
+        approvals.pause(t, thread["root"])
+        approvals.resume(t, thread["root"])
+    assert _status_of("alpha", thread["root"])[0] == "ready"
+
+
+def test_pause_leaves_a_running_reviewer_alone(alpha):
+    """Resuming from ``scheduled`` always lands in ``ready``, which would turn
+    a reviewer run back into an implementation run."""
+    from hermes_cli import kanban_db
+    tid = _review_card("alpha", "alpha", title="reviewed")
+    with _conn("alpha") as conn:
+        assert kanban_db.claim_review_task(conn, tid)
+    with pytest.raises(approvals.TeamError) as err:
+        approvals.pause(_team_alpha(), tid)
+    assert err.value.code == "E_TEAM_INVALID"
+    assert _status_of("alpha", tid)[0] == "running"
+
+
+def test_pause_and_resume_refuse_when_there_is_nothing_to_move(alpha):
+    t = _team_alpha()
+    with pytest.raises(approvals.TeamError) as err:
+        approvals.pause(t, alpha["waiting"])
+    assert err.value.code == "E_TEAM_INVALID"
+    with pytest.raises(approvals.TeamError) as err:
+        approvals.resume(t, alpha["open"])
+    assert err.value.code == "E_TEAM_INVALID"
+    assert _status_of("alpha", alpha["waiting"]) == ("blocked", "needs_input")
+
+
+def test_pause_of_another_tenants_card_is_not_found(alpha):
+    stranger = _card("alpha", tenant="beta", title="not yours")
+    with pytest.raises(approvals.TeamError) as err:
+        approvals.pause(_team_alpha(), stranger)
+    assert err.value.code == "E_TEAM_NOT_FOUND"
+    assert _status_of("alpha", stranger)[0] == "ready"
+
+
+def test_cli_pause_and_resume_round_trip(thread, parser, capsys):
+    code, env, out = _run(parser, "pause", thread["spawned"], "--json",
+                          capsys=capsys)
+    assert code == 0
+    assert env["data"]["action"] == "pause"
+    assert thread["root"] in env["data"]["paused"]
+    assert out.out.count("\n") == 1                     # exactly one object
+    code, env, _out = _run(parser, "resume", thread["spawned"], "--json",
+                           capsys=capsys)
+    assert code == 0
+    assert env["data"]["statuses"][thread["root"]] == "ready"
