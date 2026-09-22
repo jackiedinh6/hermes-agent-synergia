@@ -1725,10 +1725,7 @@
     }).join(" · ");
 
     return h("div", { className: "ht-members" },
-      h("div", { className: "ht-rail-head" },
-        h("span", { className: "ht-kicker" }, "members · " + members.length),
-        h(Muted, null, open || "no open cards")
-      ),
+      h(Muted, null, open || "no open cards"),
       members.length
         ? h("div", { className: "ht-members-list" }, members.map(function (member) {
             const cards = byAssignee[member.profile] || [];
@@ -1775,6 +1772,8 @@
   function TeamRail(props) {
     const teams = props.teams || [];
     const live = props.live;
+    // The selected team's box opens onto its members; collapsed by default.
+    const [shown, setShown] = hooks.useState(false);
     return h("div", { className: "ht-rail" },
       h("div", { className: "ht-rail-head" },
         h("span", { className: "ht-kicker" }, "teams")
@@ -1782,33 +1781,51 @@
       teams.length
         ? h("div", { className: "ht-rail-list" }, teams.map(function (row) {
             const selected = props.selected === row.slug;
+            const expandable = selected && live && live.team;
             const counts = (selected && live && live.counts) || row.counts || {};
             const running = Number(counts.running || 0);
             const blocked = Number(counts.blocked || 0);
-            return h("button", {
+            const count = expandable ? (live.team.members || []).length : row.members;
+            const name = h("span", { className: "ht-rail-name" }, row.display_name || row.slug);
+            const meta = h("span", { className: "ht-rail-meta" },
+              running
+                ? h("span", { className: "ht-dot ht-lane-running", title: running + " running" })
+                : null,
+              blocked
+                ? h("span", { className: "ht-dot ht-lane-blocked", title: blocked + " blocked" })
+                : null,
+              expandable
+                ? h("span", { className: "ht-rail-caret", "aria-hidden": true }, shown ? "▾" : "▸")
+                : null,
+              h(Muted, null, count + (count === 1 ? " member" : " members"))
+            );
+            if (!expandable) {
+              return h("button", {
+                key: row.slug,
+                type: "button",
+                className: cn("ht-rail-item", selected && "ht-rail-item-on"),
+                title: row.workdir || row.slug,
+                onClick: function () { props.onSelect(row.slug); },
+              }, name, meta);
+            }
+            // A div, not a button: the member rows inside are buttons.
+            return h("div", {
               key: row.slug,
-              type: "button",
-              className: cn("ht-rail-item", selected && "ht-rail-item-on"),
-              title: row.workdir || row.slug,
-              onClick: function () { props.onSelect(row.slug); },
+              className: "ht-rail-item ht-rail-item-on ht-rail-item-open",
             },
-              h("span", { className: "ht-rail-name" }, row.display_name || row.slug),
-              h("span", { className: "ht-rail-meta" },
-                running
-                  ? h("span", { className: "ht-dot ht-lane-running", title: running + " running" })
-                  : null,
-                blocked
-                  ? h("span", { className: "ht-dot ht-lane-blocked", title: blocked + " blocked" })
-                  : null,
-                h(Muted, null, row.members + (row.members === 1 ? " member" : " members"))
-              )
+              h("button", {
+                type: "button", className: "ht-rail-toggle",
+                title: row.workdir || row.slug,
+                "aria-expanded": shown,
+                onClick: function () { setShown(!shown); },
+              }, name, meta),
+              shown ? h(MemberPanel, {
+                team: live.team, tasks: live.tasks, parked: live.parked, counts: live.counts,
+                onOpen: props.onOpen,
+              }) : null
             );
           }))
-        : h("p", { className: "ht-hint" }, "No teams yet — create one in Settings."),
-      live && live.team ? h(MemberPanel, {
-        team: live.team, tasks: live.tasks, parked: live.parked, counts: live.counts,
-        onOpen: props.onOpen,
-      }) : null
+        : h("p", { className: "ht-hint" }, "No teams yet — create one in Settings.")
     );
   }
 

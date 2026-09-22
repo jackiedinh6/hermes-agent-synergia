@@ -509,12 +509,20 @@
 .ht-rail-name { font-weight: 650; letter-spacing: -0.01em; word-break: break-word; }
 .ht-rail-meta { display: flex; align-items: center; gap: .3rem; font-size: .72rem; }
 .ht-dot { width: .5rem; height: .5rem; display: inline-block; background: var(--ht-lane, var(--color-border)); }
+.ht-rail-item-open { cursor: default; }
+.ht-rail-toggle {
+  display: flex; flex-direction: column; gap: .2rem; width: 100%;
+  border: 0; background: transparent; padding: 0; cursor: pointer;
+  font: inherit; color: inherit; text-align: left;
+}
+.ht-rail-toggle:focus-visible { outline: 1px solid var(--color-ring, var(--color-primary)); }
+.ht-rail-caret { display: inline-block; width: .7rem; color: var(--color-muted-foreground); }
 
 .ht-members {
   display: flex; flex-direction: column; gap: .3rem;
   border-top: 1px solid var(--color-border); padding-top: .5rem; margin-top: .2rem;
 }
-.ht-members .ht-rail-head { flex-wrap: wrap; font-size: .72rem; }
+.ht-members > .ht-muted { font-size: .72rem; }
 .ht-members-list { display: flex; flex-direction: column; gap: .2rem; }
 .ht-member {
   --ht-role: var(--color-muted-foreground);
@@ -660,7 +668,6 @@
   .ht-rail { overflow-y: visible; }
   .ht-rail-list { flex-direction: row; overflow-x: auto; overflow-y: hidden; }
   .ht-rail-item { min-width: 10rem; }
-  .ht-members-list { display: grid; grid-template-columns: repeat(auto-fill, minmax(12rem, 1fr)); }
   .ht-thread-scroll { max-height: 60vh; }
   .ht-msg { max-width: 100%; }
 }
