@@ -11,10 +11,11 @@ the one verb that actually moves it:
 =============== ========================================== ==================
 lane            predicate                                   verb
 =============== ========================================== ==================
-``needs_input`` ``blocked`` AND ``block_kind='needs_input'`` approve / reject
+``needs_input`` ``blocked``/``triage`` AND
+                ``block_kind='needs_input'``                 approve / reject
 ``stuck``       ``blocked`` AND any other kind               release
 ``review``      ``review``                                   approve / reject
-``triage``      ``triage``                                   release
+``triage``      ``triage`` AND any other kind                release
 ``guarded``     ``ready``, newest event
                 ``respawn_guarded``                          release
 =============== ========================================== ==================
@@ -22,7 +23,9 @@ lane            predicate                                   verb
 ``needs_input`` needs both halves: ``unblock_task`` deliberately keeps
 ``block_kind`` across an unblock (``kanban_db.py``, the comment inside
 :func:`unblock_task`), so the kind alone would also match every card that was
-*already* approved.
+*already* approved. It also covers ``triage``: an agent that parks on a
+person a second time after an answer trips ``BLOCK_RECURRENCE_LIMIT``, and
+that card is still waiting on the same kind of decision.
 
 A card is *stuck* when it is blocked for any other reason: the dispatcher's
 circuit breaker gave up on it (``kanban_db_dispatch._record_failure`` writes
@@ -34,13 +37,15 @@ agent parked it on a ``capability``/``transient`` cause nobody has cleared.
 The last three lanes are cards the substrate can park with nothing watching
 them. ``review`` starves outright when ``kanban.review_dispatch`` is off — the
 dispatcher then skips the whole lane, so an approved card sits there forever.
-``triage`` is where ``_route_block`` sends a card at ``BLOCK_RECURRENCE_LIMIT``.
+``triage`` is where ``_route_block`` sends a card at ``BLOCK_RECURRENCE_LIMIT``
+for any cause other than a human decision.
 ``guarded`` is ``check_respawn_guard`` holding a ready row back over quota,
 auth or a live PR; ``rate_limit_cooldown`` retries forever by design and never
 blocks, so nothing else would ever show it.
 
 Approve, reject and release are comment + one transition, and which transition
-depends on the lane. On a blocked card they are ``unblock_task``, as before.
+depends on the lane. On a blocked card they are ``unblock_task``, as before;
+on a triaged one ``specify_triage_task``.
 On a ``review`` card approve is :func:`complete_task` — the substrate's own
 sanctioned path ("``review`` for human approval") and the only one that works
 with ``review_dispatch`` off — and reject is ``reopen_review_task``. That is
@@ -86,7 +91,7 @@ QUEUE_KINDS = (NEEDS_INPUT, STUCK, REVIEW, TRIAGE, GUARDED)
 
 # The card statuses each lane can live in — which rows a lane has to read.
 LANE_STATUSES = {
-    NEEDS_INPUT: (BLOCKED_STATUS,),
+    NEEDS_INPUT: (BLOCKED_STATUS, TRIAGE_STATUS),
     STUCK: (BLOCKED_STATUS,),
     REVIEW: (REVIEW_STATUS,),
     TRIAGE: (TRIAGE_STATUS,),
@@ -165,8 +170,10 @@ def _conn_ctx(t):
 
 
 def is_pending(task) -> bool:
-    """The inbox predicate: blocked AND parked on a human."""
-    return (getattr(task, "status", None) == BLOCKED_STATUS
+    """The inbox predicate: parked on a human. ``triage`` counts too: a second
+    ``needs_input`` block after an answer trips the substrate's
+    ``BLOCK_RECURRENCE_LIMIT`` and lands there, still waiting on a person."""
+    return (getattr(task, "status", None) in (BLOCKED_STATUS, TRIAGE_STATUS)
             and (getattr(task, "block_kind", None) or "") == NEEDS_INPUT)
 
 
@@ -297,9 +304,9 @@ def _queue_rows(t, kinds) -> list[dict]:
     """The parked cards of *t* in the requested lanes, newest wait first.
 
     One ``list_tasks`` query per card status the requested lanes can live in
-    — at most three, and only one when the caller asks for a single lane. The
-    lane itself is then decided per row, so the statuses two lanes share
-    (``blocked`` for needs_input/stuck, ``review`` for review/guarded) are
+    — at most four, and at most two when the caller asks for a single lane.
+    The lane itself is then decided per row, so the statuses two lanes share
+    (``blocked`` for needs_input/stuck, ``triage`` for needs_input/triage) are
     still read once.
     """
     import time
@@ -769,13 +776,21 @@ def _move_reopen(conn, t, task, text):
 
 
 def _move_specify(conn, t, task, text):
-    """The ``triage`` lane: ``triage -> todo``, where parent gating still
+    """The ``triage`` rows: ``triage -> todo``, where parent gating still
     applies. ``author=None`` keeps it to one comment — the decision comment is
     already written."""
     from hermes_cli import kanban_db
     return ("specified"
             if kanban_db.specify_triage_task(conn, task.id, author=None)
             else None)
+
+
+def _move_resume(conn, t, task, text):
+    """The ``needs_input`` lane. A triaged card is specified back to ``todo``,
+    because ``unblock_task`` only moves ``blocked`` rows."""
+    if getattr(task, "status", None) == TRIAGE_STATUS:
+        return _move_specify(conn, t, task, text)
+    return _move_unblock(conn, t, task, text)
 
 
 def _move_clear_guard(conn, t, task, text):
@@ -797,8 +812,8 @@ def _move_clear_guard(conn, t, task, text):
     return "cleared_guard" if kanban_db.unblock_task(conn, task.id) else "blocked"
 
 
-_APPROVE_MOVES = {NEEDS_INPUT: _move_unblock, REVIEW: _move_complete}
-_REJECT_MOVES = {NEEDS_INPUT: _move_unblock, REVIEW: _move_reopen}
+_APPROVE_MOVES = {NEEDS_INPUT: _move_resume, REVIEW: _move_complete}
+_REJECT_MOVES = {NEEDS_INPUT: _move_resume, REVIEW: _move_reopen}
 _RELEASE_MOVES = {STUCK: _move_unblock, TRIAGE: _move_specify,
                   GUARDED: _move_clear_guard}
 
@@ -848,8 +863,9 @@ def _decide(t, task_id: str, *, body: str, text: str, author, action: str,
 def approve(t, task_id: str, note: str, *, author=None) -> dict:
     """Record the decision and move the card on.
 
-    ``needs_input`` returns to the pool — the assignee resumes, acts on the
-    note and completes the card itself. ``review`` is completed here: the
+    ``needs_input`` returns to the pool (unblocked, or specified out of
+    ``triage``) — the assignee resumes, acts on the note and completes the
+    card itself. ``review`` is completed here: the
     operator has already made the decision the card was waiting for, and with
     ``review_dispatch`` off no agent run can ever make it again.
     """
@@ -860,8 +876,9 @@ def approve(t, task_id: str, note: str, *, author=None) -> dict:
 
 
 def reject(t, task_id: str, reason: str, *, author=None, park: bool = False) -> dict:
-    """Record requested changes. ``needs_input`` unblocks, ``review`` reopens
-    to the implementer; ``park=True`` records the comment and moves nothing."""
+    """Record requested changes. ``needs_input`` returns to the pool,
+    ``review`` reopens to the implementer; ``park=True`` records the comment
+    and moves nothing."""
     reason = _require_text("reject", task_id, reason)
     return _decide(t, task_id, body=f"{REJECT_PREFIX}: {reason}", text=reason,
                    author=author, action="reject",

@@ -949,6 +949,85 @@ def test_a_refusal_names_the_verb_that_moves_the_card_in_every_lane(alpha):
     assert "hermes team approve" in exc.value.remedy
 
 
+# ── a human gate asked twice ─────────────────────────────────────────────────
+#
+# Regression for the design gate that could not be approved a second time:
+# after "request changes" the architect parks on the operator again, the
+# second `needs_input` block trips BLOCK_RECURRENCE_LIMIT, and the card lands
+# in `triage` — where only "release" used to move it.
+
+def _asked_twice(board, tenant, **kw):
+    """A card parked on a person, answered, and parked on a person again —
+    through the substrate's own transitions, so the routing is production's."""
+    from hermes_cli import kanban_db
+    tid = _card(board, tenant=tenant, block="needs_input",
+                reason="design approval", **kw)
+    with _conn(board) as conn:
+        assert kanban_db.unblock_task(conn, tid)
+        assert kanban_db.block_task(conn, tid, kind="needs_input",
+                                    reason="design approval, revised")
+    assert _status_of(board, tid) == ("triage", "needs_input")
+    return tid
+
+
+def test_a_repeat_human_block_stays_in_the_needs_input_lane(alpha):
+    tid = _asked_twice("alpha", "alpha", title="the design")
+    t = storage.load().teams["alpha"]
+    assert tid in {r["id"] for r in approvals.pending(t)}
+    rows = {r["id"]: r for r in approvals.queue(t)}
+    assert rows[tid]["reason_kind"] == "needs_input"
+    assert rows[tid]["block_reason"] == "design approval, revised"
+    assert tid not in {r["id"] for r in approvals.queue(t, kinds=["triage"])}
+    assert approvals.detail(t, tid)["awaiting_approval"] is True
+
+
+def test_approve_specifies_a_repeat_human_block_back_into_the_pool(alpha):
+    tid = _asked_twice("alpha", "alpha", title="the design")
+    t = storage.load().teams["alpha"]
+    res = approvals.approve(t, tid, "ship the revised design")
+    assert res["lane"] == "needs_input"
+    assert res["transition"] == "specified"
+    assert res["unblocked"] is True
+    assert res["status"] == "ready"
+    assert _comments_of("alpha", tid)[-1][1] == \
+        "APPROVED: ship the revised design"
+    assert tid not in {r["id"] for r in approvals.pending(t)}
+
+
+def test_reject_returns_a_repeat_human_block_and_the_next_ask_is_pending(alpha):
+    """``specify_triage_task`` keeps the recurrence count, so every later ask
+    lands in triage too — and each one must still be decidable."""
+    from hermes_cli import kanban_db
+    tid = _asked_twice("alpha", "alpha", title="the design")
+    t = storage.load().teams["alpha"]
+    res = approvals.reject(t, tid, "split the storage layer out")
+    assert res["transition"] == "specified"
+    assert _status_of("alpha", tid)[0] == "ready"
+    with _conn("alpha") as conn:
+        assert kanban_db.block_task(conn, tid, kind="needs_input",
+                                    reason="design approval, third cut")
+    assert _status_of("alpha", tid) == ("triage", "needs_input")
+    assert approvals.approve(t, tid, "good")["transition"] == "specified"
+
+
+def test_release_refuses_a_repeat_human_block_and_names_approve(alpha):
+    tid = _asked_twice("alpha", "alpha", title="the design")
+    t = storage.load().teams["alpha"]
+    with pytest.raises(Exception) as exc:
+        approvals.release(t, tid, "try again")
+    assert "hermes team approve" in exc.value.remedy
+    assert _status_of("alpha", tid) == ("triage", "needs_input")
+
+
+def test_a_repeat_human_block_still_pings_the_operator(alpha, monkeypatch):
+    tid = _asked_twice("alpha", "alpha", title="the design")
+    monkeypatch.setattr(approvals, "notify_home_channels",
+                        lambda *a, **kw: ["telegram"])
+    out = approvals.on_blocked(tid, "alpha")
+    assert out["needs_input"] is True
+    assert out["platforms"] == ["telegram"]
+
+
 # ── the review-loop guard ────────────────────────────────────────────────────
 
 def _review_rounds(board, tid, n):

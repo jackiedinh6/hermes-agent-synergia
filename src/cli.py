@@ -3096,10 +3096,10 @@ def _cmd_status(args) -> int:
 # ── approvals: the operator inbox ────────────────────────────────────────────
 #
 # The queue is a VIEW over the board, never new state. Two lanes, both inside
-# the team's tenant: a card waits on a human exactly when status='blocked' AND
-# block_kind='needs_input', and it is stuck when it is blocked for anything
-# else (the dispatcher gave up on it, or an agent parked it on a capability it
-# does not have). The predicates, the comment bodies and the refusals all live
+# the team's tenant: a card waits on a human exactly when
+# block_kind='needs_input' and status is 'blocked' (or 'triage' after a repeat
+# block), and it is stuck when it is blocked for anything else (the dispatcher
+# gave up on it, or an agent parked it on a capability it does not have). The predicates, the comment bodies and the refusals all live
 # in ``approvals.py`` so this CLI and the dashboard routes cannot drift.
 
 

@@ -1037,8 +1037,9 @@ async def _decision_route(request: Request, slug: str, task_id: str,
 async def post_team_task_approve(request: Request, slug: str, task_id: str):
     """``{note, confirm: "<task_id>"}`` — the lane picks the move.
 
-    On a ``needs_input`` card: comment + unblock, and the assignee resumes,
-    acts on the note and completes it. On a ``review`` card: comment +
+    On a ``needs_input`` card: comment + back to the pool (unblocked, or
+    specified out of ``triage``), and the assignee resumes, acts on the note
+    and completes it. On a ``review`` card: comment +
     complete, because the operator has just made the only decision that card
     was waiting for and no agent run will make it again. Either way the
     children are promoted by the completion, not by this route.
@@ -1050,9 +1051,9 @@ async def post_team_task_approve(request: Request, slug: str, task_id: str):
 async def post_team_task_reject(request: Request, slug: str, task_id: str):
     """``{reason, confirm: "<task_id>", park?}`` — comment, then rework.
 
-    ``needs_input`` unblocks; ``review`` reopens to the implementer named in
-    the ``review_requested`` event. ``park: true`` records the comment and
-    moves nothing.
+    ``needs_input`` returns to the pool; ``review`` reopens to the
+    implementer named in the ``review_requested`` event. ``park: true``
+    records the comment and moves nothing.
     """
     return await _decision_route(request, slug, task_id, action="reject")
 
