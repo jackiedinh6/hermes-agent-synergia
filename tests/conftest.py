@@ -127,3 +127,73 @@ def profile(hermes_root):
         return home
 
     return _make
+
+
+def _git(workdir, *args) -> str:
+    import subprocess
+    return subprocess.run(
+        ["git", "-c", "user.name=test", "-c", "user.email=test@example.invalid",
+         "-c", "commit.gpgsign=false", "-C", str(workdir), *args],
+        capture_output=True, text=True, check=True).stdout.strip()
+
+
+@pytest.fixture
+def result_thread(hermes_root):
+    """Factory: a worktree thread as the dispatcher leaves it — each card on
+    its own ``wt/<name>`` branch off the workdir HEAD, nothing merged back.
+
+    ``root`` (no commits of its own) has two children: ``design``, a sibling
+    that diverges, and ``step1`` → ``step2``, a step chain, so ``wt/step2``
+    contains ``wt/step1``. Cards complete in that order; names in ``running``
+    stay running. Returns ``SimpleNamespace(workdir, start, ids, git)`` with
+    ``ids`` mapping name → card id and ``git`` bound to the workdir.
+    """
+    import functools
+    import types
+    from hermes_cli import kanban_db, kanban_db_connect
+
+    cards = [("root", None, None, ()),
+             ("design", "master", "design.md", ("root",)),
+             ("step1", "master", "step1.py", ("root",)),
+             ("step2", "wt/step1", "step2.py", ("step1",))]
+
+    def build(workdir, board, tenant, *, running=()):
+        workdir = pathlib.Path(workdir)
+        workdir.mkdir(parents=True, exist_ok=True)
+        git = functools.partial(_git, workdir)
+        git("init", "-q")
+        git("symbolic-ref", "HEAD", "refs/heads/master")
+        (workdir / "README.md").write_text("seed\n", encoding="utf-8")
+        git("add", "-A")
+        git("commit", "-q", "-m", "initial snapshot")
+        start = git("rev-parse", "HEAD")
+        kanban_db.create_board(board, name=board)
+        ids: dict = {}
+        with kanban_db_connect.connect_closing(
+                db_path=kanban_db.kanban_db_path(board)) as conn:
+            for n, (name, off, filename, parents) in enumerate(cards, 1):
+                branch = f"wt/{name}"
+                if filename is None:
+                    git("branch", branch, start)
+                else:
+                    git("checkout", "-q", "-b", branch, off)
+                    (workdir / filename).write_text(f"{name}\n", encoding="utf-8")
+                    git("add", filename)
+                    git("commit", "-q", "-m", f"{name}: add {filename}")
+                    git("checkout", "-q", "master")
+                tid = kanban_db.create_task(
+                    conn, title=name, tenant=tenant, workspace_kind="worktree",
+                    branch_name=branch, parents=[ids[p] for p in parents],
+                    initial_status="running", board=board)
+                # created_at is whole seconds: pin it so `root` roots the thread.
+                done = name not in running
+                conn.execute(
+                    "UPDATE tasks SET status = ?, created_at = ?, started_at = ?, "
+                    "completed_at = ? WHERE id = ?",
+                    ("done" if done else "running", 1_000 + n, 1_000 + n,
+                     2_000 + n if done else None, tid))
+                conn.commit()
+                ids[name] = tid
+        return types.SimpleNamespace(workdir=workdir, start=start, ids=ids, git=git)
+
+    return build

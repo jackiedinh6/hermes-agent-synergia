@@ -165,6 +165,42 @@ def test_ensure_worktree_repo_failure_is_team_error(tmp_path):
     assert "git" in ei.value.remedy
 
 
+
+# ── merge_result: a finished thread's result branch ─────────────────────────
+
+def test_merge_result_fast_forwards_to_the_newest_head(world, result_thread):
+    th = result_thread(world.workdir, "proj-board", "proj")
+    preview = resolve.merge_result(world.team, th.ids["root"])
+    assert preview["card"] == th.ids["step2"]
+    assert preview["ahead"] == 2 and preview["merged"] is False
+    assert [o["branch"] for o in preview["others"]] == ["wt/design"]
+    assert th.git("rev-parse", "HEAD") == th.start
+    # any card of the thread names it
+    done = resolve.merge_result(world.team, th.ids["design"], apply=True)
+    assert done["merged"] is True
+    assert th.git("rev-parse", "HEAD") == th.git("rev-parse", "wt/step2")
+    assert (world.workdir / "step2.py").is_file()
+    assert not (world.workdir / "design.md").exists()
+    again = resolve.merge_result(world.team, th.ids["root"], apply=True)
+    assert again["ahead"] == 0 and again["merged"] is False
+
+
+@pytest.mark.parametrize("change", ["commit", "edit"])
+def test_merge_result_only_fast_forwards_a_clean_checkout(world, result_thread,
+                                                          change):
+    th = result_thread(world.workdir, "proj-board", "proj")
+    (world.workdir / "README.md").write_text("operator\n")
+    if change == "commit":
+        th.git("commit", "-q", "-am", "operator change")
+    head = th.git("rev-parse", "HEAD")
+    assert resolve.merge_result(world.team, th.ids["root"])["blocker"]
+    with pytest.raises(TeamError) as ei:
+        resolve.merge_result(world.team, th.ids["root"], apply=True)
+    assert ei.value.code == "E_TEAM_INVALID"
+    assert th.git("rev-parse", "HEAD") == head
+    assert (world.workdir / "README.md").read_text() == "operator\n"
+
+
 # ── member block ────────────────────────────────────────────────────────────
 
 def test_existing_member_full_block(world, monkeypatch):

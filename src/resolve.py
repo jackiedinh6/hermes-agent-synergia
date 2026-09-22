@@ -61,8 +61,8 @@ import yaml
 
 from . import model
 from .errors import (
-    E_TEAM_DRIFT_UNFIXED, E_TEAM_INVALID, E_TEAM_MANAGED, E_TEAM_NO_PROFILE,
-    TeamError,
+    E_TEAM_DRIFT_UNFIXED, E_TEAM_INVALID, E_TEAM_MANAGED, E_TEAM_NOT_FOUND,
+    E_TEAM_NO_PROFILE, TeamError,
 )
 
 # §4.3's ``counts`` block is exactly these six buckets, in this order.
@@ -985,6 +985,137 @@ def prepare_worktree_workdir(team: "model.Team") -> None:
         if os.path.isdir(workdir):
             ensure_worktree_repo(workdir)
     require_worktree_workdir(team)
+
+
+# ── the result branch: fast-forward the workdir to a finished thread ────────
+
+_MERGE_COMMITS_MAX = 20
+
+
+def _git_in(workdir: str):
+    import subprocess
+
+    def git(*args, check=True, timeout=60):
+        r = subprocess.run(["git", "-C", workdir, *args],
+                           capture_output=True, text=True, timeout=timeout)
+        if check and r.returncode != 0:
+            raise subprocess.SubprocessError(
+                (r.stderr or r.stdout).strip()[-500:]
+                or f"git {args[0]} exited {r.returncode}")
+        return r
+    return git
+
+
+def thread_of(team: "model.Team", card_id: str) -> tuple:
+    """``(root_id, tasks)`` of the thread holding *card_id* on the team's
+    board, tenant-scoped like :func:`task_forest`."""
+    for root_id, group in task_forest(team.board, team.tenant or team.slug).items():
+        if any(t.id == card_id for t in group["tasks"]):
+            return root_id, group["tasks"]
+    raise TeamError(
+        E_TEAM_NOT_FOUND,
+        f"no card {card_id!r} for team {team.slug} on board {team.board!r}",
+        hint="Only cards in the team's tenant are visible here.",
+        remedy=f"hermes team status {team.slug}")
+
+
+def merge_result(team: "model.Team", card_id: str, *, apply: bool = False) -> dict:
+    """Fast-forward the workdir's checked-out branch to the result of the
+    thread *card_id* belongs to. The substrate never merges a worktree card's
+    branch, so without this a finished thread's work lives only under
+    ``<workdir>/.worktrees/<id>`` and the next thread branches off a HEAD
+    that never saw it.
+
+    The result is the newest finished *head*: a done worktree card whose
+    branch no other done card's branch contains. A step chain has one head,
+    its last card; a head the result does not contain is reported in
+    ``others`` and left alone. Only a fast-forward is ever made — a base that
+    moved on, or tracked changes in the main checkout, is a ``blocker`` in the
+    preview and a refusal under *apply*."""
+    import subprocess
+    root_id, tasks = thread_of(team, card_id)
+    workdir = os.path.realpath(os.path.expanduser(team.workdir or ""))
+    out = {"team": team.slug, "workdir": workdir, "root": root_id,
+           "card": None, "title": None,
+           "branch": None, "base": None, "from": None, "to": None, "ahead": 0,
+           "commits": [], "others": [], "blocker": None, "merged": False,
+           "dry_run": not apply}
+    if not workdir_has_commit(workdir):
+        raise TeamError(
+            E_TEAM_INVALID,
+            f"team {team.slug}: workdir {workdir} is not a git repo with a commit",
+            hint="Only a worktree team's workdir has branches to merge.",
+            remedy=f"hermes team sync {team.slug} --apply")
+    git = _git_in(workdir)
+    try:
+        base = git("symbolic-ref", "--quiet", "--short", "HEAD",
+                   check=False).stdout.strip()
+        if not base:
+            raise TeamError(
+                E_TEAM_INVALID,
+                f"workdir {workdir} has a detached HEAD; nothing to fast-forward",
+                hint="Check out the branch new work should land on.",
+                remedy=f"git -C {workdir} switch master")
+        head = git("rev-parse", "HEAD").stdout.strip()
+        out["base"], out["from"] = base, head
+
+        done = []
+        for t in tasks:
+            if t.status != "done" or t.workspace_kind != "worktree" \
+                    or not t.branch_name:
+                continue
+            r = git("rev-parse", "--verify", "--quiet",
+                    f"refs/heads/{t.branch_name}^{{commit}}", check=False)
+            if r.returncode == 0:
+                done.append((t, r.stdout.strip()))
+        if not done:
+            return out
+
+        def contains(tip: str, sha: str) -> bool:
+            return sha == tip or git("merge-base", "--is-ancestor", sha, tip,
+                                     check=False).returncode == 0
+
+        heads = [(t, sha) for t, sha in done
+                 if not any(o != sha and contains(o, sha) for _, o in done)]
+        task, sha = max(heads, key=lambda h: (h[0].completed_at or 0, h[0].id))
+        out.update(card=task.id, title=task.title, branch=task.branch_name,
+                   to=sha, others=[
+                       {"card": t.id, "branch": t.branch_name, "title": t.title}
+                       for t, o in heads
+                       if o != sha and not contains(head, o)])
+        out["ahead"] = int(git("rev-list", "--count", f"{head}..{sha}").stdout)
+        if not out["ahead"]:
+            return out
+        log = git("log", f"-n{_MERGE_COMMITS_MAX}", "--format=%h%x09%s",
+                  f"{head}..{sha}").stdout
+        out["commits"] = [dict(zip(("sha", "subject"), ln.split("\t", 1)))
+                          for ln in log.splitlines() if "\t" in ln]
+        if not contains(sha, head):
+            out["blocker"] = {
+                "message": f"{base} has commits that {task.branch_name} does "
+                           "not; a fast-forward would drop them",
+                "remedy": f"git -C {workdir} merge {task.branch_name}"}
+        elif git("diff", "--quiet", "HEAD", check=False).returncode != 0:
+            out["blocker"] = {
+                "message": f"workdir {workdir} has uncommitted changes to "
+                           "tracked files",
+                "remedy": f"git -C {workdir} status"}
+        if not apply:
+            return out
+        if out["blocker"]:
+            raise TeamError(E_TEAM_INVALID, out["blocker"]["message"],
+                            hint="Only a fast-forward onto a clean checkout "
+                                 "is made; anything else is a human merge.",
+                            remedy=out["blocker"]["remedy"])
+        git("merge", "--ff-only", "--quiet", sha, timeout=300)
+        out["merged"] = True
+        return out
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise TeamError(
+            E_TEAM_INVALID, f"git failed in workdir {workdir}: {exc}",
+            hint="The workdir must be a git repo the plugin can read and "
+                 "fast-forward.",
+            remedy=f"hermes team merge {team.slug} {card_id} --apply") from exc
 
 
 # ── S10a read seam: the profile's installed skills (deviation 8) ───────────

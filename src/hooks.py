@@ -348,6 +348,30 @@ def on_task_blocked(**kw: Any) -> None:
         return None
 
 
+def on_task_completed(**kw: Any) -> None:
+    """When the last card of a worktree team's thread finishes, fast-forward
+    the workdir to the thread's result branch — the substrate never merges a
+    ``wt/<id>`` branch, so otherwise the work lives only under ``.worktrees/``
+    and the next thread branches off a HEAD that never saw it.
+
+    Fires in the worker AFTER the board's DB commit, so the finished row reads
+    back as ``done``. The whole decision is :func:`approvals.on_completed`;
+    this observer never raises and never blocks a completion."""
+    try:
+        from . import approvals
+        result = approvals.on_completed(str(kw.get("task_id") or ""),
+                                        str(kw.get("board") or ""))
+        if result.get("merged"):
+            log.info("hermes-agent-synergia: merged %s (%s) into the workdir "
+                     "of team=%s root=%s", result["branch"], result["sha"][:12],
+                     result["team"], result["root"])
+        elif result.get("skipped"):
+            log.info("hermes-agent-synergia: auto-merge skipped team=%s root=%s: %s",
+                     result["team"], result["root"], result["skipped"])
+    except Exception:                              # noqa: BLE001 — observer
+        return None
+
+
 def _fresh(task_ids) -> list:
     """*task_ids* minus the ones already pushed, remembering the rest."""
     fresh = [tid for tid in task_ids if tid not in _NOTIFIED]

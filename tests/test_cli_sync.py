@@ -38,6 +38,7 @@ import pytest
 import yaml
 
 import cli
+import model
 import storage
 from test_reconcile_apply import _SEED
 
@@ -533,3 +534,25 @@ def test_sync_requires_team_or_all(hermes_root, parser, capsys):
     assert "usage" in err
     code, _env, err = run(parser, "sync", "teamx", "--all", capsys=capsys)
     assert code == 2
+
+
+# ── merge: fast-forward the workdir to a finished thread's result ───────────
+
+def test_merge_previews_by_default_and_applies_with_the_flag(parser, capsys, W,
+                                                             result_thread):
+    th = result_thread(W("rt"), "rt", "rt")
+    storage.upsert(model.Team.from_dict({
+        "slug": "rt", "board": "rt", "workdir": str(th.workdir),
+        "workspace_policy": "worktree", "orchestrator": "lead",
+        "members": [{"profile": "lead", "role": "orchestrator", "primary": True}]}))
+    code, env, _err = run(parser, "merge", "rt", th.ids["root"], "--json",
+                          capsys=capsys)
+    assert code == 0
+    assert env["data"]["card"] == th.ids["step2"]
+    assert env["data"]["dry_run"] is True and env["data"]["ahead"] == 2
+    assert th.git("rev-parse", "HEAD") == th.start
+    code, _env, err = run(parser, "merge", "rt", th.ids["root"], "--apply",
+                          capsys=capsys)
+    assert code == 0
+    assert "merged 2 commit(s) into master" in err
+    assert th.git("rev-parse", "HEAD") == th.git("rev-parse", "wt/step2")

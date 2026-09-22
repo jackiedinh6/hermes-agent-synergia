@@ -53,6 +53,11 @@ def register(ctx):
     # No-op when no messaging platform has a home channel.
     ctx.register_hook("kanban_task_blocked", hooks.on_task_blocked)
 
+    # The substrate never merges a worktree card's branch: when a thread's
+    # last card finishes, fast-forward the workdir to its result. Settings
+    # key `auto_merge`; false leaves it to `hermes team merge`.
+    ctx.register_hook("kanban_task_completed", hooks.on_task_completed)
+
     # The stuck lane's push: the dispatcher's circuit breaker blocks a card
     # with a raw UPDATE and fires no kanban_task_blocked, so the give-up ids
     # are read off DispatchResult.auto_blocked once per tick instead.

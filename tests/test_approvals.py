@@ -1102,3 +1102,60 @@ def test_cli_pause_and_resume_round_trip(thread, parser, capsys):
                            capsys=capsys)
     assert code == 0
     assert env["data"]["statuses"][thread["root"]] == "ready"
+
+
+# ── auto-merge: the kanban_task_completed backend ────────────────────────────
+#
+# The substrate never merges a worktree card's branch, so a finished thread's
+# work stays under .worktrees/ until something fast-forwards the workdir.
+
+def _worktree_team(slug, workdir):
+    storage.upsert(Team.from_dict({
+        "slug": slug, "board": slug, "workdir": str(workdir),
+        "workspace_policy": "worktree", "orchestrator": "lead",
+        "members": [{"profile": "lead", "role": "orchestrator", "primary": True}]}))
+    storage._reset_caches_for_tests()
+
+
+def test_last_card_done_merges_the_result_and_says_so_once(tmp_path,
+                                                            result_thread):
+    th = result_thread(tmp_path / "work", "omega", "omega")
+    _worktree_team("omega", th.workdir)
+    res = approvals.on_completed(th.ids["step2"], "omega")
+    assert res["merged"] is True and res["root"] == th.ids["root"]
+    assert th.git("rev-parse", "HEAD") == th.git("rev-parse", "wt/step2")
+    [(author, body)] = _comments_of("omega", th.ids["root"])
+    assert author == approvals.AUTO_MERGE_AUTHOR
+    assert body.startswith("Merged `wt/step2` into `master`")
+    assert "Not included: `wt/design`" in body
+    # a parallel completion that finds the result already in stays silent
+    assert approvals.on_completed(th.ids["design"], "omega")["merged"] is False
+    assert len(_comments_of("omega", th.ids["root"])) == 1
+
+
+@pytest.mark.parametrize("why", ["card still running", "auto_merge off"])
+def test_auto_merge_waits_for_the_whole_thread_and_has_an_off_switch(
+        tmp_path, hermes_root, result_thread, why):
+    running = ("step2",) if why == "card still running" else ()
+    th = result_thread(tmp_path / "work", "omega", "omega", running=running)
+    _worktree_team("omega", th.workdir)
+    if why == "auto_merge off":
+        (hermes_root / "config.yaml").write_text(
+            "plugins:\n  entries:\n    hermes-agent-synergia:\n"
+            "      settings:\n        auto_merge: false\n", encoding="utf-8")
+    assert approvals.on_completed(th.ids["step1"], "omega")["merged"] is False
+    assert th.git("rev-parse", "HEAD") == th.start
+    assert _comments_of("omega", th.ids["root"]) == []
+
+
+def test_auto_merge_refusal_leaves_the_checkout_and_names_the_fix(
+        tmp_path, result_thread):
+    th = result_thread(tmp_path / "work", "omega", "omega")
+    _worktree_team("omega", th.workdir)
+    (th.workdir / "README.md").write_text("operator\n", encoding="utf-8")
+    res = approvals.on_completed(th.ids["step2"], "omega")
+    assert res["merged"] is False and res["skipped"]
+    assert th.git("rev-parse", "HEAD") == th.start
+    [(_author, body)] = _comments_of("omega", th.ids["root"])
+    assert body.startswith("Auto-merge skipped:")
+    assert f"hermes team merge omega {th.ids['root']}" in body

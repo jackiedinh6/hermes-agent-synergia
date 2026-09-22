@@ -1588,6 +1588,7 @@
   //   POST /teams/{slug}/tasks/{id}/note            steer the running card
   //   POST /teams/{slug}/tasks/{id}/approve|reject  answer a parked one
   //   POST /teams/{slug}/tasks/{root}/pause|resume  park / re-queue the thread
+  //   GET|POST /teams/{slug}/tasks/{root}/merge    the thread's result branch
   // ═══════════════════════════════════════════════════════════════════════════
 
   const THREAD_LIVE_MS = 1000;      // work is moving — the operator is watching
@@ -2471,6 +2472,74 @@
     );
   }
 
+  function finished(roots, rootId) {
+    const root = roots.filter(function (r) { return r.id === rootId; })[0];
+    return !!root && root.total > 0 && root.done === root.total;
+  }
+
+  // A worktree thread's work lands on its own wt/<id> branches, which the
+  // substrate never merges. The bar names the thread's result branch and
+  // whether the workdir already holds it; approvals.on_completed fast-forwards
+  // on its own when auto_merge is on, the button is the fallback. It polls only
+  // while the result is still ahead, so a merge the hook lands shows up.
+  function ResultBar(props) {
+    const [live, setLive] = hooks.useState(true);
+    const [busy, setBusy] = hooks.useState(false);
+    const [actionError, setActionError] = hooks.useState(null);
+    const path = "/teams/" + encodeURIComponent(props.slug) + "/tasks/" +
+      encodeURIComponent(props.rootId) + "/merge";
+    const poll = usePoll(path, live, [props.refreshKey], BUSY_POLL_MS);
+    const p = poll.data;
+    const stale = !p || p.root !== props.rootId;
+
+    hooks.useEffect(function () {
+      setLive(!p || p.ahead > 0);
+    }, [p]);
+    hooks.useEffect(function () { setActionError(null); }, [path]);
+
+    if (poll.error && stale) return h(ErrorNote, { error: poll.error, what: "The result branch" });
+    if (stale || !p.card) return null;
+
+    function merge() {
+      setBusy(true);
+      setActionError(null);
+      apiSend("POST", path, {}).then(function (data) {
+        setBusy(false);
+        props.onToast(data && data.merged
+          ? "Merged " + data.branch + " into " + data.base + " (" + String(data.to).slice(0, 12) + ")."
+          : "Nothing to merge: " + p.base + " already holds " + p.branch + ".");
+        poll.reload();
+      }, function (err) {
+        setBusy(false);
+        setActionError(err);
+        if (isReadOnly(err)) props.onReadOnly();
+      });
+    }
+
+    const commits = (p.commits || []).map(function (c) { return c.sha + " " + c.subject; }).join("\n");
+    const code = function (text) { return h("code", { className: "ht-code" }, text); };
+    const status = !p.ahead
+      ? h(React.Fragment, null, "In ", code(p.base), " · files in ", code(p.workdir))
+      : h(React.Fragment, null,
+        p.ahead + (p.ahead === 1 ? " commit" : " commits") + " ahead of ", code(p.base),
+        p.blocker ? " — " + p.blocker.message : null);
+
+    return h("div", { className: cn("ht-note", !p.ahead ? "ht-note-ok" : p.blocker ? "ht-note-warn" : "ht-note-info") },
+      h("strong", null, "Result: ", code(p.branch)),
+      h("p", null, p.title),
+      h("p", { title: commits || undefined }, status),
+      (p.others || []).length ? h("p", { className: "ht-hint" }, "Not included: ",
+        p.others.map(function (o, i) {
+          return h(React.Fragment, { key: o.card }, i ? ", " : null, code(o.branch), " (" + o.title + ")");
+        })) : null,
+      p.ahead && p.blocker ? h("code", { className: "ht-remedy" }, p.blocker.remedy) : null,
+      actionError ? h(ErrorNote, { error: actionError, what: "The merge" }) : null,
+      p.ahead && !p.blocker ? h("div", { className: "ht-row ht-row-end" },
+        h(UI.Button, { size: "sm", disabled: props.readOnly || busy, onClick: merge },
+          busy ? "Merging…" : "Merge into " + p.base)) : null
+    );
+  }
+
   function ChatScreen(props) {
     const slug = props.slug;
     const [tab, setTab] = hooks.useState("chat");
@@ -2602,6 +2671,12 @@
           if (verb === "pause") setPinnedRoot(rootId);
           reload();
         },
+      }) : null,
+      tab === "chat" && rootId && finished(roots, rootId) &&
+        team.workspace_policy === "worktree" ? h(ResultBar, {
+        slug: slug, rootId: rootId, refreshKey: refreshKey,
+        readOnly: props.readOnly, onReadOnly: props.onReadOnly,
+        onToast: props.onToast,
       }) : null,
       // The decision lives where the work is read: the same ApprovalCard the
       // inbox draws, so the artifacts, the block reason and the verbs are all

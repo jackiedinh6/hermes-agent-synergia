@@ -701,6 +701,13 @@ def _run_checks_inner(results: list, root: Path) -> None:
                 + "; scheduled ∈ VALID_STATUSES")
     check(results, "pause/resume surface (schedule_task, worker kill)", c_pause_surface)
 
+    # ---- auto-merge of a finished thread ------------------------------------
+
+    # 51. approvals.on_completed fast-forwards the workdir from this observer;
+    #     a renamed hook would silently stop every auto-merge.
+    check(results, "kanban_task_completed ∈ VALID_HOOKS",
+          lambda: _hook("kanban_task_completed"))
+
     # ---- notices: printed, never asserted (Do.8, Do.13) ----
 
     # Compat-window operator notice (Do.8).

@@ -1145,6 +1145,47 @@ async def post_team_task_resume(request: Request, slug: str, task_id: str):
     return await _thread_route(request, slug, task_id, action="resume")
 
 
+@router.get("/teams/{slug}/tasks/{task_id}/merge")
+def get_team_task_merge(slug: str, task_id: str):
+    """Preview of ``hermes team merge``: the result branch of the card's
+    thread, the commits it holds over the workdir's branch, and what would
+    stop a fast-forward. Writes nothing."""
+    cli = _mod("cli")
+    t, err, _reg, _storage = _team_or_404(slug)
+    if err is not None:
+        return err
+    try:
+        data = cli._merge_impl(t.slug, task_id)
+    except Exception as exc:                                # noqa: BLE001
+        return _team_err(exc)
+    data.pop("_human", None)
+    return _ok(data)
+
+
+@router.post("/teams/{slug}/tasks/{task_id}/merge")
+async def post_team_task_merge(request: Request, slug: str, task_id: str):
+    """``{}`` — ``hermes team merge --apply``: fast-forward the workdir's
+    branch to the thread's result. No ``confirm``: only a fast-forward onto a
+    clean checkout is made, so nothing in the workdir is lost."""
+    guard = _mutation_guard(request)
+    if guard is not None:
+        return guard
+    body = await _body(request)
+    if isinstance(body, JSONResponse):
+        return body
+    t, err, _reg, _storage = _team_or_404(slug)
+    if err is not None:
+        return err
+    cli = _mod("cli")
+    try:
+        data = await _thread(lambda: cli._merge_impl(t.slug, task_id,
+                                                     apply=True))
+    except Exception as exc:                                # noqa: BLE001
+        return _team_err(exc)
+    data.pop("_human", None)
+    return _ok(data)
+
+
 @router.get("/teams/{slug}/drift")
 def get_team_drift(slug: str):
     reconcile = _mod("reconcile")

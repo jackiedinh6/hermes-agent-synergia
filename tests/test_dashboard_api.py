@@ -1764,3 +1764,33 @@ def test_release_moves_a_triage_card_and_is_refused_on_a_review_card(client,
                     json={"note": "run it again", "confirm": review})
     assert r.status_code == 400
     assert "hermes team approve" in r.json()["error"]["remedy"]
+
+
+# ── the result branch: GET / POST …/merge ────────────────────────────────────
+
+def test_merge_preview_is_a_read_and_apply_a_guarded_write(client, world,
+                                                          result_thread):
+    th = result_thread(pathlib.Path(_TMP_ROOT[0]) / "work-rt", "rt", "rt")
+    storage.upsert(model.Team.from_dict({
+        "slug": "rt", "board": "rt", "workdir": str(th.workdir),
+        "workspace_policy": "worktree", "orchestrator": "lead",
+        "members": [{"profile": "lead", "role": "orchestrator", "primary": True}]}))
+    path = f"{P}/teams/rt/tasks/{th.ids['root']}/merge"
+    r = client.get(path)
+    assert r.status_code == 200, r.text
+    d = r.json()["data"]
+    assert d["card"] == th.ids["step2"] and d["ahead"] == 2
+    assert "_human" not in d
+    assert client.get(f"{P}/teams/rt/tasks/t_nope/merge").status_code == 404
+    _writes_off(world)
+    assert client.post(path, json={}).status_code == 405
+    assert th.git("rev-parse", "HEAD") == th.start
+    cfg = yaml.safe_load((world / "config.yaml").read_text())
+    cfg["plugins"]["entries"]["hermes-agent-synergia"]["settings"][
+        "dashboard_writes"] = True
+    (world / "config.yaml").write_text(yaml.safe_dump(cfg), encoding="utf-8")
+    r = client.post(path, json={})
+    assert r.status_code == 200, r.text
+    assert r.json()["data"]["merged"] is True
+    assert th.git("rev-parse", "HEAD") == th.git("rev-parse", "wt/step2")
+

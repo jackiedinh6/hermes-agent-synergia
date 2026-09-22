@@ -182,7 +182,7 @@ def test_non_team_profile_registers_no_pre_tool_call(_teamhome):
     assert "pre_tool_call" not in _hook_names(rec)
     # ... while the rest of §5.3 still registers:
     assert _hook_names(rec) == ["kanban_task_claimed", "kanban_task_blocked",
-                                "on_kanban_dispatch_tick"]
+                                "kanban_task_completed", "on_kanban_dispatch_tick"]
     assert len(rec.tools) == 10
     assert {t["name"] for t in rec.tools} >= {"team_whoami", "team_list"}
     assert all(t["toolset"] == "team" for t in rec.tools)
@@ -209,7 +209,8 @@ def test_team_member_with_policy_registers_exactly_one(_teamhome):
     pre = [cb for name, cb in rec.hooks if name == "pre_tool_call"]
     assert len(pre) == 1 and callable(pre[0])
     assert _hook_names(rec) == ["pre_tool_call", "kanban_task_claimed",
-                                "kanban_task_blocked", "on_kanban_dispatch_tick"]
+                                "kanban_task_blocked", "kanban_task_completed",
+                                "on_kanban_dispatch_tick"]
 
 
 def test_member_of_policy_off_team_registers_no_pre_tool_call(_teamhome):
@@ -561,6 +562,18 @@ def test_on_task_blocked_never_raises(_teamhome, monkeypatch):
 
     monkeypatch.setattr(approvals, "on_blocked", _boom)
     assert hooks.on_task_blocked(task_id="t_x", board="px-board") is None
+
+
+def test_on_task_completed_never_raises(_teamhome, monkeypatch):
+    """The auto-merge observer runs git in the worker that just finished; a
+    fault there must never surface as a failed completion."""
+    from hermes_agent_synergia import approvals
+
+    def _boom(*_a, **_kw):
+        raise RuntimeError("git is on fire")
+
+    monkeypatch.setattr(approvals, "on_completed", _boom)
+    assert hooks.on_task_completed(task_id="t_x", board="px-board") is None
 
 
 # ── the stuck lane: the on_kanban_dispatch_tick observer ─────────────────────

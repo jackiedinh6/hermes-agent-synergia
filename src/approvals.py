@@ -2,7 +2,7 @@
 
 One module, three callers — ``cli.py`` (``hermes team approvals|approve|reject``),
 ``dashboard/plugin_api.py`` (the ``/approvals`` routes) and ``hooks.py`` (the
-``kanban_task_blocked`` observer). They share this core so the predicate, the
+``kanban_task_blocked`` and ``kanban_task_completed`` observers). They share this core so the predicate, the
 comment bodies and the refusals cannot drift between surfaces.
 
 The card is the whole state. Five lanes, disjoint by construction, each with
@@ -1160,6 +1160,88 @@ def on_auto_blocked(task_ids, board: str, reg=None) -> dict:
     return result
 
 
+
+# ── auto-merge a finished thread ─────────────────────────────────────────────
+
+AUTO_MERGE_AUTHOR = "team:auto-merge"
+
+
+def auto_merge_enabled() -> bool:
+    """``plugins.entries.hermes-agent-synergia.settings.auto_merge`` (true by
+    default): false leaves every result branch for ``hermes team merge``."""
+    from . import cli
+    value = cli._settings().get("auto_merge", True)
+    if isinstance(value, str):
+        value = value.strip().lower() not in ("false", "off", "0", "no", "")
+    return bool(value)
+
+
+def merge_comment(res: dict) -> str:
+    """The root-card line for a :func:`resolve.merge_result` that merged."""
+    n = res["ahead"]
+    body = (f"Merged `{res['branch']}` into `{res['base']}` "
+            f"(`{res['to'][:12]}`, {n} commit{'' if n == 1 else 's'}). "
+            f"Files: `{res['workdir']}`.")
+    if res["others"]:
+        body += " Not included: " + ", ".join(
+            f"`{o['branch']}` ({o['card']})" for o in res["others"]) + "."
+    return body
+
+
+def on_completed(task_id: str, board: str, reg=None) -> dict:
+    """``kanban_task_completed`` body: once every card of a worktree team's
+    thread is done, fast-forward the workdir to the thread's result branch
+    (:func:`resolve.merge_result`) and say so on the root card.
+
+    Anything short of a clean fast-forward is left to a human, with one
+    comment on the root card naming why and what to run. A refusal that a
+    parallel completion already made moot — its merge landed the result —
+    stays silent."""
+    from hermes_cli import kanban_db, kanban_db_connect
+    from . import resolve
+    result = {"task_id": task_id, "board": board, "team": None, "root": None,
+              "merged": False, "skipped": None}
+    if not task_id or not board or not auto_merge_enabled():
+        return result
+    db_path = kanban_db.kanban_db_path(board)
+    if not db_path.is_file():
+        return result
+    with kanban_db_connect.connect_closing(db_path=db_path) as conn:
+        task = kanban_db.get_task(conn, task_id)
+    if task is None:
+        return result
+    t = team_for_tenant(task.tenant, reg=reg)
+    if t is None or t.board != board or t.workspace_policy != "worktree":
+        return result
+    result["team"] = t.slug
+    try:
+        root_id, tasks = resolve.thread_of(t, task_id)
+    except TeamError:
+        return result
+    result["root"] = root_id
+    if any(x.status != "done" for x in tasks):
+        return result
+    try:
+        res = resolve.merge_result(t, root_id, apply=True)
+    except TeamError as exc:
+        try:
+            if not resolve.merge_result(t, root_id)["ahead"]:
+                return result
+        except TeamError:
+            pass
+        result["skipped"] = exc.message
+        body = (f"Auto-merge skipped: {exc.message}. Fix: `{exc.remedy}` — "
+                f"then `hermes team merge {t.slug} {root_id}` shows what is left.")
+    else:
+        if not res["merged"]:
+            return result
+        result.update(merged=True, branch=res["branch"], sha=res["to"])
+        body = merge_comment(res)
+    with kanban_db_connect.connect_closing(db_path=db_path) as conn:
+        kanban_db.add_comment(conn, root_id, AUTO_MERGE_AUTHOR, body)
+    return result
+
+
 # ── the review-round loop guard ──────────────────────────────────────────────
 
 REVIEW_ROUND_EVENT = "review_requested"
@@ -1201,8 +1283,8 @@ def check_review_loop(task_ids, board: str, *, limit=None) -> dict:
     lane the operator already reads and fires ``kanban_task_blocked``, so the
     existing :func:`on_blocked` push does the notifying. Blocking a running
     card closes its run; the substrate's own ``reap_terminal_workers`` ends the
-    worker that outlives it. This is the one write this module makes without
-    an operator verb, which is why it has an off switch.
+    worker that outlives it. Like :func:`on_completed`, this writes without an
+    operator verb, which is why it has an off switch.
     """
     from hermes_cli import kanban_db, kanban_db_connect
     ids = [str(i) for i in (task_ids or []) if i]

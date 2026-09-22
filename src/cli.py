@@ -2,7 +2,8 @@
 
 Commands here (spec §8.1 subset): ``list``, ``show``, ``create``, ``destroy``,
 ``add-member``, ``remove-member``, ``doctor``, ``sync``, ``set-board``,
-``set-workdir`` (S11), ``profiles``/``recipes`` with S6a; ``clone``/``import``/``export`` (S17);
+``set-workdir`` (S11), ``merge`` (fast-forward the workdir to a finished
+thread's result branch), ``profiles``/``recipes`` with S6a; ``clone``/``import``/``export`` (S17);
 ``adopt`` (S18, §8.1: an existing board becomes a team, tenant backfill),
 ``status`` (S18b: the read side of adopt — tenant-scoped counts + open
 cards; same read path as the ``team_status`` tool and the dashboard's
@@ -495,6 +496,16 @@ def _setup_parser_impl(p):
                          "the dir, move the board default_workdir, init git "
                          "(worktree) and every primary member's terminal.cwd")
     _add_busy_flags(sp)
+    sp.add_argument("--json", action="store_true")
+
+    sp = subs.add_parser(
+        "merge",
+        help="Fast-forward the team's workdir to the result branch of the "
+             "card's thread (preview unless --apply)")
+    sp.add_argument("team")
+    sp.add_argument("card", help="Any card of the thread, usually its root")
+    sp.add_argument("--apply", action="store_true",
+                    help="Fast-forward now; without it, only preview")
     sp.add_argument("--json", action="store_true")
 
     sp = subs.add_parser(
@@ -2322,6 +2333,54 @@ def _cmd_set_workdir(args) -> int:
     return payload["exit_code"]
 
 
+def _merge_lines(res: dict) -> list:
+    if not res["card"]:
+        return [f"thread {res['root']} ({res['team']}): no finished worktree "
+                "branch to merge"]
+    n = res["ahead"]
+    lines = [f"result of thread {res['root']} ({res['team']}): {res['branch']} "
+             f"— {res['card']}: {res['title']}"]
+    if res["merged"]:
+        lines.append(f"  merged {n} commit(s) into {res['base']}: "
+                     f"{res['from'][:12]}..{res['to'][:12]}")
+    elif not n:
+        lines.append(f"  already in {res['base']}")
+    else:
+        lines.append(f"  {n} commit(s) ahead of {res['base']}")
+    lines += [f"    {c['sha']} {c['subject']}" for c in res["commits"]]
+    if not res["merged"] and n:
+        if res["blocker"]:
+            lines.append(f"  blocked: {res['blocker']['message']}")
+            lines.append(f"  remedy: {res['blocker']['remedy']}")
+        else:
+            lines.append(f"  apply with: hermes team merge {res['team']} "
+                         f"{res['root']} --apply")
+    lines += [f"  not included: {o['branch']} — {o['card']}: {o['title']}"
+              for o in res["others"]]
+    lines.append(f"  files: {res['workdir']}")
+    return lines
+
+
+def _merge_impl(slug: str, card: str, *, apply: bool = False) -> dict:
+    """merge core, shared with ``/teams/{slug}/tasks/{card}/merge``: preview
+    or fast-forward the workdir to the result branch of *card*'s thread
+    (:func:`resolve.merge_result`). Raises TeamError."""
+    from . import approvals, resolve
+    team = approvals.team_or_raise(slug)
+    res = resolve.merge_result(team, card, apply=apply)
+    res["_human"] = _merge_lines(res)
+    return res
+
+
+def _cmd_merge(args) -> int:
+    try:
+        payload = _merge_impl(args.team, args.card, apply=bool(args.apply))
+    except TeamError as err:
+        return _fail(err, json_mode=args.json, team=args.team)
+    _emit(payload, json_mode=args.json)
+    return 0
+
+
 # ── clone / export / import (S17, §5.7, §8.1) ────────────────────────────────
 
 def _binding_required_error(cmd: str, operands: str) -> TeamError:
@@ -3451,6 +3510,7 @@ _COMMANDS = {
     "sync": _cmd_sync,
     "set-board": _cmd_set_board,
     "set-workdir": _cmd_set_workdir,
+    "merge": _cmd_merge,
     "clone": _cmd_clone,
     "export": _cmd_export,
     "import": _cmd_import,
@@ -3464,7 +3524,7 @@ def handle(args) -> int:
         print("usage: hermes team {list,show,create,adopt,status,approvals,"
               "approve,reject,release,note,pause,resume,destroy,add-member,"
               "remove-member,doctor,"
-              "profiles,recipes,sync,set-board,set-workdir,clone,export,"
+              "profiles,recipes,sync,set-board,set-workdir,merge,clone,export,"
               "import} ...",
               file=sys.stderr)
         return 2

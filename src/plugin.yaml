@@ -15,7 +15,7 @@ provides_tools: [team_whoami, team_list, team_show, team_status, team_catalog,
                  team_create_task, team_assign, team_handoff, team_sync,
                  team_attach_path]
 provides_hooks: [pre_tool_call, kanban_task_claimed, kanban_task_blocked,
-                 on_kanban_dispatch_tick]
+                 kanban_task_completed, on_kanban_dispatch_tick]
 python_dependencies: []            # stdlib + PyYAML (already a Hermes dependency)
 config_schema:
   registry_dir:   {type: str,  default: "",       description: "Override the host-global registry directory."}
@@ -32,5 +32,6 @@ config_schema:
   approvals_notify: {type: str, default: "home", description: "home | off — push cards blocked on a human decision, and cards the dispatcher gave up on, to every configured gateway home channel."}
   review_round_limit: {type: int, default: 3,    description: "Review rounds a card may take before it is parked for a human decision. 0 disables the loop guard."}
   parked_lanes:     {type: bool, default: true,  description: "Show review / triage / respawn-guarded cards in the approvals inbox alongside blocked ones."}
+  auto_merge:       {type: bool, default: true,  description: "Fast-forward the workdir's branch to a thread's result branch when its last card finishes. false leaves it to `hermes team merge`."}
   worker_exit_guard: {type: str, default: "wrapper",
                                                  description: "wrapper | off — wrap dispatcher workers through $HERMES_BIN so a worker that never reached the model exits non-zero instead of being booked as a protocol violation."}
