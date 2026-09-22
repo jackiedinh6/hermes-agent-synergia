@@ -1598,6 +1598,9 @@
   // Every lane a team can still be doing something in. `done` is the only one
   // that does not hold the working folder hostage.
   const OPEN_LANES = ["todo", "ready", "running", "review", "blocked"];
+  // Which card speaks for a thread or a member: the one running, else the one
+  // parked on a human, else the rest of the open lanes.
+  const LIVE_RANK = { running: 0, blocked: 1, review: 2, ready: 3, todo: 4, scheduled: 5 };
   const TEAM_KEY = "hermes-agent-synergia.team";
 
   // approvals.py stamps every operator comment with its verb, so a recorded
@@ -1660,21 +1663,132 @@
     try { return window.localStorage.getItem(TEAM_KEY) || null; } catch (e) { return null; }
   }
 
+  const MEMBER_LABELS = {
+    blocked: "blocked", review: "in review", ready: "queued", todo: "queued",
+    scheduled: "paused",
+  };
+
+  // A dangling profile outranks any card: nothing it holds can run.
+  function memberState(cards, parked, resolved) {
+    if (resolved && resolved.exists === false) {
+      return { lane: "blocked", label: "profile missing", card: null };
+    }
+    let card = null;
+    cards.forEach(function (task) {
+      if (LIVE_RANK[task.status] === undefined) return;
+      if (!card || LIVE_RANK[task.status] < LIVE_RANK[card.status]) card = task;
+    });
+    if (!card) return { lane: null, label: "idle", card: null };
+    if (card.status === "running") return { lane: "running", label: "working", card: card };
+    const row = parked[card.id];
+    if (row) {
+      return {
+        lane: "blocked", card: card,
+        label: owesDecision(row) ? "needs you" : PARK_LANE_LABEL[laneOf(row)],
+      };
+    }
+    return { lane: card.status, label: MEMBER_LABELS[card.status] || card.status, card: card };
+  }
+
+  function memberTally(cards) {
+    const n = { running: 0, blocked: 0, review: 0, queued: 0, paused: 0, done: 0 };
+    cards.forEach(function (task) {
+      if (task.status === "ready" || task.status === "todo") n.queued++;
+      else if (task.status === "scheduled") n.paused++;
+      else if (n[task.status] !== undefined) n[task.status]++;
+    });
+    return Object.keys(n).filter(function (k) { return n[k]; })
+      .map(function (k) { return n[k] + " " + k; }).join(" · ");
+  }
+
+  // Profiles are named "{team}-{short}" by default; the rail is too narrow to
+  // repeat the team on every row. The full name stays in the tooltip.
+  function shortProfile(profile, slug) {
+    const prefix = slug + "-";
+    return profile.indexOf(prefix) === 0 && profile.length > prefix.length
+      ? profile.slice(prefix.length) : profile;
+  }
+
+  function MemberPanel(props) {
+    const team = props.team;
+    const members = team.members || [];
+    const resolved = (team._resolved || {}).members || {};
+    const byAssignee = {};
+    (props.tasks || []).forEach(function (task) {
+      if (!task.assignee) return;
+      (byAssignee[task.assignee] = byAssignee[task.assignee] || []).push(task);
+    });
+    const parked = {};
+    (props.parked || []).forEach(function (row) { parked[row.id] = row; });
+    const open = openLanes(props.counts).map(function (lane) {
+      return props.counts[lane] + " " + (STATUS_LABELS[lane] || lane);
+    }).join(" · ");
+
+    return h("div", { className: "ht-members" },
+      h("div", { className: "ht-rail-head" },
+        h("span", { className: "ht-kicker" }, "members · " + members.length),
+        h(Muted, null, open || "no open cards")
+      ),
+      members.length
+        ? h("div", { className: "ht-members-list" }, members.map(function (member) {
+            const cards = byAssignee[member.profile] || [];
+            const info = resolved[member.profile] || {};
+            const state = memberState(cards, parked, resolved[member.profile]);
+            const main = isMain(member, team);
+            const tally = memberTally(cards);
+            // Most rosters leave every role at the default; "member" on each
+            // row would say nothing.
+            const role = member.role && member.role !== "member" ? member.role : "";
+            const card = state.card;
+            const title = [
+              member.profile + " · " + (member.role || "member") +
+                (member.managed ? " · managed" : " · adopted") + (main ? " · main" : ""),
+              info.description || "",
+              card ? "Click to open the thread of " + (card.title || card.id) : "",
+            ].filter(Boolean).join("\n");
+            return h(card ? "button" : "div", {
+              key: member.profile,
+              type: card ? "button" : undefined,
+              className: cn("ht-member", roleClass(member.role), card && "ht-member-click"),
+              title: title,
+              onClick: card ? function () { props.onOpen(card.root_id || card.id); } : undefined,
+            },
+              h("span", { className: "ht-member-head" },
+                h("span", { className: "ht-chip-dot" }),
+                h("span", { className: "ht-member-name" }, shortProfile(member.profile, team.slug)),
+                main ? h("span", { className: "ht-chip-main" }, "main") : null
+              ),
+              h("span", { className: "ht-member-meta" },
+                h("span", { className: cn("ht-status", state.lane && "ht-lane-" + state.lane) },
+                  state.label),
+                h(Muted, null, [role, tally].filter(Boolean).join(" · "))
+              ),
+              card ? h("span", { className: "ht-member-card" }, card.title || card.id) : null
+            );
+          }))
+        : h("p", { className: "ht-hint" }, "No members — add one in Settings.")
+    );
+  }
+
+  // `live` is the selected team's own board, polled by ChatScreen; the other
+  // rows only carry the slower /teams counts.
   function TeamRail(props) {
     const teams = props.teams || [];
+    const live = props.live;
     return h("div", { className: "ht-rail" },
       h("div", { className: "ht-rail-head" },
         h("span", { className: "ht-kicker" }, "teams")
       ),
       teams.length
         ? h("div", { className: "ht-rail-list" }, teams.map(function (row) {
-            const counts = row.counts || {};
+            const selected = props.selected === row.slug;
+            const counts = (selected && live && live.counts) || row.counts || {};
             const running = Number(counts.running || 0);
             const blocked = Number(counts.blocked || 0);
             return h("button", {
               key: row.slug,
               type: "button",
-              className: cn("ht-rail-item", props.selected === row.slug && "ht-rail-item-on"),
+              className: cn("ht-rail-item", selected && "ht-rail-item-on"),
               title: row.workdir || row.slug,
               onClick: function () { props.onSelect(row.slug); },
             },
@@ -1690,7 +1804,11 @@
               )
             );
           }))
-        : h("p", { className: "ht-hint" }, "No teams yet — create one in Settings.")
+        : h("p", { className: "ht-hint" }, "No teams yet — create one in Settings."),
+      live && live.team ? h(MemberPanel, {
+        team: live.team, tasks: live.tasks, parked: live.parked, counts: live.counts,
+        onOpen: props.onOpen,
+      }) : null
     );
   }
 
@@ -2380,11 +2498,10 @@
 
     // The thread follows the work unless the operator pinned one: the card
     // that is running, else the one parked on a human, else the newest start.
-    const RANK = { running: 0, blocked: 1, review: 2, ready: 3, todo: 4, scheduled: 5 };
     let liveRoot = null;
     let liveRank = 99;
     tasks.forEach(function (task) {
-      const rank = RANK[task.status];
+      const rank = LIVE_RANK[task.status];
       if (rank === undefined || rank >= liveRank) return;
       liveRank = rank;
       liveRoot = task.root_id || task.id;
@@ -2414,18 +2531,27 @@
       setTab("chat");
     }
 
-    if (teamError) {
-      return h("div", { className: "ht-panel" },
-        h(ErrorNote, { error: teamError, what: "This team", onRetry: reload }));
-    }
-    if (!team) return h(Loading, { label: "Loading team…" });
+    const counts = (status && status.counts) || ((team || {})._resolved || {}).counts || {};
+    const rail = h(TeamRail, {
+      teams: props.teams, selected: slug, onSelect: props.onSelect,
+      live: team ? {
+        team: team, tasks: tasks, counts: counts,
+        parked: (approvalsPoll.data || {}).approvals || [],
+      } : null,
+      onOpen: openThread,
+    });
 
-    const counts = (status && status.counts) || (team._resolved || {}).counts || {};
+    if (teamError) {
+      return h(React.Fragment, null, rail, h("div", { className: "ht-panel" },
+        h(ErrorNote, { error: teamError, what: "This team", onRetry: reload })));
+    }
+    if (!team) return h(React.Fragment, null, rail, h(Loading, { label: "Loading team…" }));
+
     const openWork = openLanes(counts).reduce(function (n, lane) {
       return n + Number(counts[lane] || 0);
     }, 0);
 
-    return h("div", { className: "ht-chat-main" },
+    return h(React.Fragment, null, rail, h("div", { className: "ht-chat-main" },
       h("div", { className: "ht-chat-head" },
         h("div", null,
           h("div", { className: "ht-kicker" }, "team"),
@@ -2494,7 +2620,7 @@
         onChanged: function () { reload(); props.onRegistryChanged(); },
         onClose: function () { setTab("chat"); },
       }) : null
-    );
+    ));
   }
 
   // `compact` is the thread's inline form: no head, no summary block — the
@@ -4701,7 +4827,8 @@
       ),
       readOnly ? h(Note, { tone: "warn", title: "Read-only dashboard" }, READONLY_MESSAGE) : null,
       screen === "chat" ? h("div", { className: "ht-chat" },
-        h(TeamRail, {
+        // ChatScreen draws the rail itself once a team is open.
+        teams && teams.length && selected ? null : h(TeamRail, {
           teams: teams || [], selected: selected,
           onSelect: selectTeam,
         }),
@@ -4713,7 +4840,8 @@
               "Settings → Teams → New team builds the roster, the board and the folder in one go.")
           : null,
         teams && teams.length && selected ? h(ChatScreen, {
-          key: selected, slug: selected, revision: revision, readOnly: readOnly,
+          key: selected, slug: selected, teams: teams, onSelect: selectTeam,
+          revision: revision, readOnly: readOnly,
           rootRef: rootRef, onReadOnly: onReadOnly, onRegistryChanged: reloadAll,
           onToast: function (message) { toaster.showToast(message, "success"); },
         }) : null

@@ -482,18 +482,20 @@
    thread. The height is viewport-relative so the composer stays put and only
    the thread scrolls; under 32rem it gives up and the page scrolls instead. */
 .ht-chat {
-  display: grid; grid-template-columns: 15rem minmax(0, 1fr); gap: .8rem;
+  display: grid; grid-template-columns: 17rem minmax(0, 1fr); gap: .8rem;
   align-items: stretch;
   height: calc(100vh - 12rem); min-height: 32rem;
 }
+/* The rail scrolls as one column: teams on top, the open team's members
+   under them. */
 .ht-rail {
-  display: flex; flex-direction: column; gap: .4rem; min-height: 0;
+  display: flex; flex-direction: column; gap: .4rem; min-height: 0; overflow-y: auto;
   border: 1px solid var(--color-border);
   background: color-mix(in srgb, var(--color-card) 62%, transparent);
   padding: .55rem;
 }
 .ht-rail-head { display: flex; align-items: center; justify-content: space-between; gap: .4rem; }
-.ht-rail-list { display: flex; flex-direction: column; gap: .25rem; overflow-y: auto; min-height: 0; }
+.ht-rail-list { display: flex; flex-direction: column; gap: .25rem; flex: 0 0 auto; }
 .ht-rail-item {
   display: flex; flex-direction: column; gap: .2rem; text-align: left;
   border: 1px solid transparent; background: transparent; cursor: pointer;
@@ -507,6 +509,30 @@
 .ht-rail-name { font-weight: 650; letter-spacing: -0.01em; word-break: break-word; }
 .ht-rail-meta { display: flex; align-items: center; gap: .3rem; font-size: .72rem; }
 .ht-dot { width: .5rem; height: .5rem; display: inline-block; background: var(--ht-lane, var(--color-border)); }
+
+.ht-members {
+  display: flex; flex-direction: column; gap: .3rem;
+  border-top: 1px solid var(--color-border); padding-top: .5rem; margin-top: .2rem;
+}
+.ht-members .ht-rail-head { flex-wrap: wrap; font-size: .72rem; }
+.ht-members-list { display: flex; flex-direction: column; gap: .2rem; }
+.ht-member {
+  --ht-role: var(--color-muted-foreground);
+  display: flex; flex-direction: column; gap: .2rem; text-align: left; min-width: 0;
+  border: 1px solid transparent; background: transparent;
+  color: var(--color-foreground); padding: .35rem .5rem; font: inherit; font-size: .8rem;
+}
+.ht-member-click { cursor: pointer; }
+.ht-member-click:hover { border-color: var(--color-border); }
+.ht-member-click:focus-visible { outline: 1px solid var(--color-ring, var(--color-primary)); }
+.ht-member-head { display: flex; align-items: center; gap: .35rem; min-width: 0; }
+.ht-member-head .ht-chip-main { margin-left: 0; color: var(--ht-role); }
+.ht-member-name { font-weight: 600; word-break: break-word; }
+.ht-member-meta { display: flex; align-items: center; flex-wrap: wrap; gap: .3rem; font-size: .72rem; }
+.ht-member-card {
+  font-size: .72rem; color: var(--color-muted-foreground);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
 
 .ht-chat-main { display: flex; flex-direction: column; gap: .6rem; min-width: 0; min-height: 0; }
 .ht-chat-head {
@@ -631,8 +657,10 @@
   /* No viewport-height chat on a narrow screen: the rail becomes a strip and
      the page scrolls as one document. */
   .ht-chat { grid-template-columns: minmax(0, 1fr); height: auto; min-height: 0; }
+  .ht-rail { overflow-y: visible; }
   .ht-rail-list { flex-direction: row; overflow-x: auto; overflow-y: hidden; }
   .ht-rail-item { min-width: 10rem; }
+  .ht-members-list { display: grid; grid-template-columns: repeat(auto-fill, minmax(12rem, 1fr)); }
   .ht-thread-scroll { max-height: 60vh; }
   .ht-msg { max-width: 100%; }
 }
