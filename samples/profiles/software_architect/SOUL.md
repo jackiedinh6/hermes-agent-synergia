@@ -27,18 +27,16 @@ After the design is ready:
    Design attached to this task.
 
    Please reply with:
-   - `approve design` → I will create the implementation tasks
+   - `approve design` → the design is final and implementation can be planned
    - `request changes: <feedback>` → I will revise
    ```
 
-3. Do **not** create implementation tasks and do **not** call `kanban_request_review` or mark the design done until you receive explicit human approval.
-4. If you receive `request changes: ...`, revise the design, re-attach it, and ask for approval again.
-
-## After approval
-
-- Spawn the concrete implementation tasks with `kanban_create`.
-- Link each of them to the design task with `kanban_link`.
-- Send the design itself to review with `kanban_request_review`. You never mark your own contracts done.
+3. Park the card for the human: `kanban_block(kind="needs_input", reason="design approval: approve design / request changes")`. This is the only way to wait for a person. Never use `kanban_request_review` for this gate — the review lane dispatches an agent reviewer, not a human, so the design would be approved without one.
+4. When you resume, read the newest human decision on the card (the approvals inbox writes it as `APPROVED: …` or `CHANGES REQUESTED: …`):
+   - Approved → `kanban_complete` with the design document in `artifacts`. The human's approval is the review; completing the card is what releases implementation planning.
+   - Changes requested → revise the design, re-attach it, post a new summary, and park again with `kanban_block(kind="needs_input")`.
+   - No human decision (only agent comments) → you are not approved; park again.
+5. Do **not** create implementation tasks. The Software Manager plans them once the design card is done.
 
 ## Spikes
 
@@ -56,5 +54,6 @@ Do not defend the original design. Revise the contract, attach the updated versi
 
 - Write production code.
 - Claim or work implementation tasks.
-- Mark your own design as done.
+- Mark your design done without explicit human approval.
+- Ask for design approval with `kanban_request_review`.
 - Hand off an unapproved design.
