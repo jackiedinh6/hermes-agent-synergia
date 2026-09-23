@@ -98,6 +98,20 @@ LANE_STATUSES = {
     GUARDED: (READY_STATUS,),
 }
 
+# A lane owes a human decision, or it does not. Both halves of this module's
+# ordering read off this one table: the inbox sorts rank 0 first, and the
+# priority floor is only ever written to a rank-0 card.
+DECISION_LANES = (NEEDS_INPUT, REVIEW)
+RELEASE_LANES = (STUCK, TRIAGE, GUARDED)
+LANE_RANK = {k: (0 if k in DECISION_LANES else 1) for k in QUEUE_KINDS}
+
+# The priority a decision card is raised to. The dispatcher orders every lane
+# by ``priority DESC, created_at ASC`` (``kanban_db_dispatch._lane_rows``), so
+# a floor above the backlog is what "the board takes this next" means — no
+# card is ever paused to make room for it. 9 clears the untouched priority-0
+# backlog and the tester's priority-5 defect convention.
+DECISION_PRIORITY = 9
+
 # The dispatcher's respawn guard writes this event and leaves the row where it
 # is, so the newest event is the only evidence the card is being held back.
 #
@@ -221,6 +235,19 @@ def _headline(comments) -> str:
     return ""
 
 
+def sort_key(row) -> tuple:
+    """The inbox order: the lanes that owe a human decision first, then the
+    newest wait first inside each rank.
+
+    Every surface sorts through this — a card raised a minute ago is the one
+    the board is waiting on, and a ``stuck`` row parked since yesterday must
+    not bury it. Ordering only: nothing here pauses a card.
+    """
+    return (LANE_RANK.get(row["reason_kind"], 1),
+            -(row["blocked_at"] or row["created_at"] or 0),
+            row["id"])
+
+
 def _attachment_view(att) -> dict:
     return {"id": att.id, "filename": att.filename, "size": int(att.size or 0),
             "content_type": att.content_type, "created_at": att.created_at,
@@ -260,6 +287,9 @@ def _row(t, conn, task, *, now: int, facts=None) -> dict:
         facts if facts is not None else _park_facts(conn, task.id))
     waiting_since = blocked_at or task.created_at
     kind = kind_of(task, newest_event)
+    comments = kanban_db.list_comments(conn, task.id)
+    attachments = [_attachment_view(a)
+                   for a in kanban_db.list_attachments(conn, task.id)]
     row = {
         "id": task.id,
         "team": t.slug,
@@ -272,9 +302,8 @@ def _row(t, conn, task, *, now: int, facts=None) -> dict:
         "age_seconds": max(0, int(now) - int(waiting_since or now)),
         "block_reason": reason,
         "block_recurrences": int(getattr(task, "block_recurrences", 0) or 0),
-        "headline": _headline(kanban_db.list_comments(conn, task.id)),
-        "attachments": [_attachment_view(a)
-                        for a in kanban_db.list_attachments(conn, task.id)],
+        "headline": _headline(comments),
+        "attachments": attachments,
         "reason_kind": kind,
         "status": task.status,
         # ``capability`` means "fix the cause outside Hermes first"; a missing
@@ -289,6 +318,13 @@ def _row(t, conn, task, *, now: int, facts=None) -> dict:
         row["failure_error"] = getattr(task, "last_failure_error", None)
         row["consecutive_failures"] = int(
             getattr(task, "consecutive_failures", 0) or 0)
+    if kind in DECISION_LANES:
+        # The card's revision, so a surface knows when a cached summary of it
+        # went stale without reading the summary itself.
+        from . import summarize
+        row["summary_key"] = summarize.fingerprint(
+            task.id, task.status, [c.id for c in comments],
+            [a["id"] for a in attachments])
     if newest_event == GUARD_EVENT:
         # ``blocker_auth`` / ``rate_limit_cooldown`` / ``recent_success`` /
         # ``active_pr`` — ``check_respawn_guard``'s own vocabulary, passed
@@ -327,7 +363,7 @@ def _queue_rows(t, kinds) -> list[dict]:
                 facts = _park_facts(conn, task.id)
                 if kind_of(task, facts[2]) in want:
                     rows.append(_row(t, conn, task, now=now, facts=facts))
-    rows.sort(key=lambda r: (-(r["blocked_at"] or r["created_at"] or 0), r["id"]))
+    rows.sort(key=sort_key)
     return rows
 
 
@@ -343,7 +379,7 @@ def _all_rows(reg, kinds) -> list[dict]:
             rows.extend(_queue_rows(reg.teams[slug], kinds))
         except (TeamError, OSError):
             continue
-    rows.sort(key=lambda r: (-(r["blocked_at"] or r["created_at"] or 0), r["id"]))
+    rows.sort(key=sort_key)
     return rows
 
 
@@ -471,6 +507,38 @@ def detail(t, task_id: str) -> dict:
     return row
 
 
+SUMMARY_ARTIFACTS_MAX = 3
+SUMMARY_ARTIFACT_BYTES = 24 * 1024
+
+
+def summary_inputs(t, task_id: str) -> dict:
+    """Everything a card says about itself, for :mod:`summarize`.
+
+    :func:`detail` plus the two things only the substrate has: the newest run
+    summary (how the implementer handed the work off — on a review card it is
+    the closest thing to "what was built") and the text of the first few
+    attachments, which is where a design document actually lives.
+    """
+    from hermes_cli import kanban_db
+    card = detail(t, task_id)
+    ctx = _conn_ctx(t)
+    if ctx is not None:
+        with ctx as conn:
+            card["run_summary"] = kanban_db.latest_summary(conn, task_id)
+    previewable = [a for a in card.get("attachments") or [] if a["previewable"]]
+    files = []
+    for att in previewable[:SUMMARY_ARTIFACTS_MAX]:
+        try:
+            blob = artifact(t, att["id"], max_bytes=SUMMARY_ARTIFACT_BYTES)
+        except (TeamError, OSError):
+            continue
+        if blob.get("text"):
+            files.append({"filename": blob["filename"], "text": blob["text"],
+                          "truncated": bool(blob["truncated"])})
+    card["artifact_texts"] = files
+    return card
+
+
 def task_attachments(t, task_ids) -> dict:
     """``{task_id: [attachment view, ...]}`` for the cards in *task_ids*.
 
@@ -578,6 +646,81 @@ def operator_author() -> str:
     return f"operator:{profile}" if profile else "operator"
 
 
+def decision_priority() -> int:
+    """``plugins.entries.hermes-agent-synergia.settings.decision_priority``
+    (:data:`DECISION_PRIORITY` by default, ``0`` to leave priorities alone)."""
+    from . import cli
+    try:
+        floor = int(cli._settings().get("decision_priority", DECISION_PRIORITY))
+    except (TypeError, ValueError):
+        return DECISION_PRIORITY
+    return max(0, floor)
+
+
+def _raise_priority(conn, task_id: str, *, floor=None):
+    """Raise one card to the decision floor; return its priority, or None when
+    the floor is off or the card is gone.
+
+    ``tasks.priority`` is accepted by ``create_task`` and by nothing else —
+    there is no public setter to call (§5.2.1), so this is a single raw
+    statement, the same documented deviation as ``cli._backfill_tenant``.
+    ``max`` is what makes it safe to run twice, and safe to run on a card an
+    operator already made hotter by hand: it never lowers a priority.
+    """
+    floor = decision_priority() if floor is None else int(floor)
+    if floor <= 0:
+        return None
+    conn.execute(
+        "update tasks set priority = max(coalesce(priority, 0), ?) where id = ?",
+        (floor, task_id))
+    row = conn.execute("select priority from tasks where id = ?",
+                       (task_id,)).fetchone()
+    return int(row[0]) if row and row[0] is not None else None
+
+
+def raise_lane_priority(board: str, *, reg=None, floor=None) -> int:
+    """Raise every card on *board* that is parked in a decision lane, and
+    return how many rows were written.
+
+    This is the entry side of the floor. ``unblock_task``/``block_task`` fire
+    hooks, but ``request_review`` fires none, so a card entering ``review``
+    is invisible — no observer can catch it one card at a time. A set-based
+    UPDATE over the decision statuses catches every entry instead,
+    whatever moved the card there, and ``priority < floor`` makes it a no-op
+    on a board that is already ordered.
+
+    Scoped to the tenants of the teams that own *board*: a card on a board
+    Hermes dispatches for something other than a team is not this plugin's to
+    reorder.
+    """
+    from hermes_cli import kanban_db, kanban_db_connect
+    floor = decision_priority() if floor is None else int(floor)
+    if floor <= 0 or not (board or "").strip():
+        return 0
+    reg = storage.load() if reg is None else reg
+    tenants = sorted({tenant_of(t) for t in reg.teams.values()
+                      if (t.board or "") == board})
+    if not tenants:
+        return 0
+    db_path = kanban_db.kanban_db_path(board)
+    if not db_path.is_file():
+        return 0
+    # ``is_pending`` in SQL: the two blocked statuses are shared with the
+    # stuck and triage lanes, so the kind has to come with them or a rank-1
+    # card is raised too.
+    parked = sorted(LANE_STATUSES[NEEDS_INPUT])
+    with kanban_db_connect.connect_closing(db_path=db_path) as conn:
+        cur = conn.execute(
+            "update tasks set priority = ?"
+            f" where tenant in ({','.join('?' * len(tenants))})"
+            " and coalesce(priority, 0) < ?"
+            "  and (status = ?"
+            f"      or (status in ({','.join('?' * len(parked))})"
+            "          and block_kind = ?))",
+            (floor, *tenants, floor, REVIEW_STATUS, *parked, NEEDS_INPUT))
+        return int(cur.rowcount or 0)
+
+
 def _stuck_cause(task) -> str:
     """What parked a stuck card: the agent's own block kind, or — when the
     dispatcher's circuit breaker did it with a raw UPDATE — no kind at all."""
@@ -655,10 +798,6 @@ def _wrong_lane(t, task, lane, reason, *, action: str, kind=None) -> TeamError:
     )
 
 
-_DECIDE_LANES = (NEEDS_INPUT, REVIEW)
-_RELEASE_LANES = (STUCK, TRIAGE, GUARDED)
-
-
 def _require_lane(allowed, action: str):
     """A ``require`` for :func:`_decide` that admits exactly *allowed*."""
     def require(t, task, lane, reason) -> None:
@@ -668,8 +807,8 @@ def _require_lane(allowed, action: str):
     return require
 
 
-_require_pending = _require_lane(_DECIDE_LANES, "approve")
-_require_stuck = _require_lane(_RELEASE_LANES, "release")
+_require_pending = _require_lane(DECISION_LANES, "approve")
+_require_stuck = _require_lane(RELEASE_LANES, "release")
 
 
 def _require_open(t, task, lane, reason) -> None:
@@ -841,6 +980,11 @@ def _decide(t, task_id: str, *, body: str, text: str, author, action: str,
         comment_id = kanban_db.add_comment(conn, task_id, author, body)
         move = (moves or {}).get(lane)
         transition = move(conn, t, task, text) if move else None
+        # A decided card is the one the board is now waiting on, so it goes
+        # above the backlog rather than behind it. A completed card has no
+        # work left to order.
+        raised = (bool(_raise_priority(conn, task_id))
+                  if transition and transition != "completed" else False)
         after = kanban_db.get_task(conn, task_id)
     return {
         "team": t.slug,
@@ -857,6 +1001,8 @@ def _decide(t, task_id: str, *, body: str, text: str, author, action: str,
         "status": getattr(after, "status", task.status),
         "assignee": getattr(after, "assignee", task.assignee),
         "title": task.title,
+        "priority": getattr(after, "priority", task.priority),
+        "priority_raised": raised,
     }
 
 
@@ -1129,6 +1275,9 @@ def on_blocked(task_id: str, board: str, reg=None) -> dict:
     if t is None:
         return result
     result["team"] = t.slug
+    # Ordering first, notification second: the floor must not depend on
+    # whether a home channel is configured.
+    result["priority_raised"] = raise_lane_priority(board, reg=reg)
     if not notify_enabled():
         result["notify"] = "off"
         return result

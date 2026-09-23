@@ -1532,6 +1532,114 @@ def test_approvals_writes_are_405_when_the_dashboard_is_read_only(
     assert client.get(f"{P}/approvals").json()["data"]["count"] == 1
 
 
+# ── the briefing route: one model call per card revision, never on the poll ──
+
+_BRIEFING = {
+    "summary": "The architect proposes Option A for the tracker.",
+    "question": "Approve Option A, or ask for Option B?",
+    "options": [
+        {"label": "Approve A", "detail": "approve design: A is fine.",
+         "verb": "approve", "recommended": True},
+        {"label": "Ask for B", "detail": "request changes: use Option B.",
+         "verb": "reject"},
+    ],
+    "risks": ["B costs a week"],
+}
+
+
+class _FakeLlm:
+    def __init__(self):
+        self.calls = 0
+
+    def complete_structured(self, **kw):
+        self.calls += 1
+        return type("R", (), {"parsed": dict(_BRIEFING), "model": "claude-test"})()
+
+
+@pytest.fixture
+def briefing(monkeypatch):
+    """The host model, replaced by a counter: these tests are about who calls
+    it and how often, not about its prose."""
+    from hermes_agent_synergia import summarize
+    fake = _FakeLlm()
+    summarize._MEMO.clear()
+    monkeypatch.setattr(summarize, "_llm", lambda: fake)
+    yield fake
+    summarize._MEMO.clear()
+
+
+def test_the_approvals_poll_carries_the_key_and_calls_no_model(client, waiting,
+                                                               briefing):
+    row = client.get(f"{P}/approvals").json()["data"]["approvals"][0]
+    assert row["summary_key"]
+    team_row = client.get(f"{P}/teams/px/approvals").json()["data"]["approvals"][0]
+    assert team_row["summary_key"] == row["summary_key"]
+    assert briefing.calls == 0
+
+
+def test_a_stuck_card_carries_no_key(client, waiting, briefing):
+    stuck = _giveup_card("px", "px")
+    rows = {r["id"]: r for r in client.get(f"{P}/approvals").json()["data"]["approvals"]}
+    assert "summary_key" not in rows[stuck]
+    assert briefing.calls == 0
+
+
+def test_the_summary_route_returns_the_briefing_once(client, waiting, briefing):
+    tid = waiting["task_id"]
+    body = client.get(f"{P}/teams/px/tasks/{tid}/summary").json()
+    assert body["ok"] is True
+    data = body["data"]
+    assert data["state"] == "ready"
+    assert data["summary"] == _BRIEFING["summary"]
+    assert [o["verb"] for o in data["options"]] == ["approve", "reject"]
+    assert data["cached"] is False
+    key = client.get(f"{P}/approvals").json()["data"]["approvals"][0]["summary_key"]
+    assert data["key"] == key
+
+    again = client.get(f"{P}/teams/px/tasks/{tid}/summary").json()["data"]
+    assert again["cached"] is True
+    assert briefing.calls == 1
+
+    forced = client.get(f"{P}/teams/px/tasks/{tid}/summary?refresh=1").json()["data"]
+    assert forced["cached"] is False
+    assert briefing.calls == 2
+
+
+def test_the_summary_route_is_readable_when_the_dashboard_is_read_only(
+        client, world, waiting, briefing):
+    _writes_off(world)
+    data = client.get(
+        f"{P}/teams/px/tasks/{waiting['task_id']}/summary").json()["data"]
+    assert data["state"] == "ready"
+
+
+def test_the_summary_route_honours_the_off_switch(client, world, waiting,
+                                                  briefing):
+    cfg = yaml.safe_load((world / "config.yaml").read_text())
+    cfg["plugins"]["entries"]["hermes-agent-synergia"]["settings"][
+        "approval_summary"] = False
+    (world / "config.yaml").write_text(yaml.safe_dump(cfg, sort_keys=False),
+                                       encoding="utf-8")
+    data = client.get(
+        f"{P}/teams/px/tasks/{waiting['task_id']}/summary").json()["data"]
+    assert data["state"] == "off"
+    assert briefing.calls == 0
+
+
+def test_the_summary_route_is_404_for_an_unknown_team(client, waiting):
+    r = client.get(f"{P}/teams/nope/tasks/{waiting['task_id']}/summary")
+    assert r.status_code == 404
+    assert r.json()["error"]["code"] == "E_TEAM_NOT_FOUND"
+
+
+def test_the_summary_route_refuses_another_tenants_card(client, waiting,
+                                                        briefing):
+    foreign = _park_card("px", "other-tenant")
+    r = client.get(f"{P}/teams/px/tasks/{foreign}/summary")
+    assert r.status_code == 404
+    assert briefing.calls == 0
+
+
 # ── the stuck lane on the dashboard ──────────────────────────────────────────
 
 def _giveup_card(board, tenant, *, title="verify the engine",

@@ -364,6 +364,66 @@ def test_cli_show_renders_body_comments_and_artifacts(alpha, parser, capsys):
     assert "design.md" in out.err
 
 
+class _FakeLlm:
+    """The host model, answering one fixed briefing."""
+
+    ANSWER = {"summary": "Option A is proposed.", "question": "A or B?",
+              "options": [{"label": "Take A", "detail": "approve design: A is fine.",
+                           "verb": "approve", "recommended": True},
+                          {"label": "Take B", "detail": "request changes: use B.",
+                           "verb": "reject"}],
+              "risks": ["B costs a week"]}
+
+    def complete_structured(self, **_kw):
+        return type("R", (), {"parsed": dict(self.ANSWER), "model": "claude-test"})()
+
+
+def _boom_llm():
+    raise RuntimeError("no model here")
+
+
+def test_cli_show_pays_no_model_call_without_the_flag(alpha, parser, capsys,
+                                                      monkeypatch):
+    """A plain listing runs in a short-lived process: it must never wait on a
+    model."""
+    from hermes_agent_synergia import summarize
+    monkeypatch.setattr(summarize, "_llm", _boom_llm)
+    code, _env, out = _run(parser, "approvals", "--show", alpha["waiting"],
+                           capsys=capsys)
+    assert code == 0
+    assert "--- summary ---" not in out.err
+
+
+def test_cli_summary_prints_the_briefing_and_its_options(alpha, parser, capsys,
+                                                         monkeypatch):
+    from hermes_agent_synergia import summarize
+    summarize._MEMO.clear()
+    monkeypatch.setattr(summarize, "_llm", lambda: _FakeLlm())
+    code, _env, out = _run(parser, "approvals", "--show", alpha["waiting"],
+                           "--summary", capsys=capsys)
+    summarize._MEMO.clear()
+    assert code == 0
+    assert "--- summary ---" in out.err
+    assert "Option A is proposed." in out.err
+    assert "decide: A or B?" in out.err
+    assert "1. [approve] Take A (recommended)" in out.err
+    assert "approve design: A is fine." in out.err
+    assert "risk: B costs a week" in out.err
+
+
+def test_cli_summary_failure_never_costs_the_card(alpha, parser, capsys,
+                                                  monkeypatch):
+    from hermes_agent_synergia import summarize
+    summarize._MEMO.clear()
+    monkeypatch.setattr(summarize, "_llm", _boom_llm)
+    code, _env, out = _run(parser, "approvals", "--show", alpha["waiting"],
+                           "--summary", capsys=capsys)
+    summarize._MEMO.clear()
+    assert code == 0
+    assert "unavailable: RuntimeError: no model here" in out.err
+    assert "the design body" in out.err       # the card still renders
+
+
 def test_cli_artifact_goes_to_stdout_so_it_can_be_piped(alpha, parser, capsys):
     code, _env, out = _run(parser, "approvals", "--show", alpha["waiting"],
                            "--artifact", "design.md", capsys=capsys)
@@ -1238,3 +1298,124 @@ def test_auto_merge_refusal_leaves_the_checkout_and_names_the_fix(
     [(_author, body)] = _comments_of("omega", th.ids["root"])
     assert body.startswith("Auto-merge skipped:")
     assert f"hermes team merge omega {th.ids['root']}" in body
+
+
+# ── the inbox's order, and the priority floor under it ───────────────────────
+#
+# Both halves of "a review card must not wait behind the backlog": the lanes
+# that owe a human decision sort first, and a card the operator has just
+# decided is raised above the untouched backlog so the dispatcher takes it
+# next. Ordering only — nothing here pauses another card.
+
+def _priority_of(board, tid):
+    with _conn(board) as conn:
+        row = conn.execute("select priority from tasks where id = ?",
+                           (tid,)).fetchone()
+    return int(row[0] or 0)
+
+
+def test_decision_lanes_sort_ahead_of_an_older_stuck_card(alpha):
+    """``alpha`` already holds a stuck card older than anything added here, so
+    a pure newest-wait-first order would bury both decision cards."""
+    review = _review_card("alpha", "alpha", title="design ready")
+    t = storage.load().teams["alpha"]
+    rows = approvals.queue(t)
+    ranks = [approvals.LANE_RANK[r["reason_kind"]] for r in rows]
+    assert ranks == sorted(ranks)
+    assert {r["id"] for r in rows[:2]} == {alpha["waiting"], review}
+    assert rows[-1]["id"] == alpha["other"]          # the stuck card, last
+
+
+def _age_block(board, tid, seconds):
+    """Push a card's park event into the past — two cards blocked in the same
+    second tie, and the order under test is the wait, not the tiebreak."""
+    with _conn(board) as conn:
+        conn.execute("update task_events set created_at = created_at - ? "
+                     "where task_id = ? and kind = 'blocked'", (seconds, tid))
+        conn.commit()
+
+
+def test_newest_wait_still_wins_inside_a_rank(alpha):
+    second = _card("alpha", tenant="alpha", title="a later decision",
+                   block="needs_input", reason="also waiting")
+    _age_block("alpha", alpha["waiting"], 3600)
+    t = storage.load().teams["alpha"]
+    waiting = [r["id"] for r in approvals.lane(t, "needs_input")]
+    assert waiting == [second, alpha["waiting"]]
+
+
+def test_queue_all_orders_decision_lanes_first_across_teams(alpha):
+    from hermes_cli import kanban_db
+    kanban_db.create_board("beta", name="beta board")
+    stuck = _card("beta", tenant="beta", title="beta stuck",
+                  block="capability", reason="no network")
+    _team("beta", "beta", tenant="beta")
+    rows = approvals.queue_all()
+    assert rows[0]["id"] == alpha["waiting"]
+    assert rows[-1]["id"] in (stuck, alpha["other"])
+    assert approvals.LANE_RANK[rows[-1]["reason_kind"]] == 1
+
+
+def test_approve_raises_the_card_above_the_backlog(alpha):
+    t = storage.load().teams["alpha"]
+    assert _priority_of("alpha", alpha["waiting"]) == 0
+    res = approvals.approve(t, alpha["waiting"], "A: OAuth app-only")
+    assert res["priority_raised"] is True
+    assert res["priority"] == approvals.DECISION_PRIORITY
+    assert _priority_of("alpha", alpha["waiting"]) == approvals.DECISION_PRIORITY
+    # the untouched backlog is left exactly where it was
+    assert _priority_of("alpha", alpha["open"]) == 0
+
+
+def test_release_raises_a_stuck_card_too(alpha):
+    t = storage.load().teams["alpha"]
+    res = approvals.release(t, alpha["other"], "network is back")
+    assert res["priority_raised"] is True
+    assert _priority_of("alpha", alpha["other"]) == approvals.DECISION_PRIORITY
+
+
+def test_approving_a_review_card_raises_nothing_because_it_is_done(alpha):
+    review = _review_card("alpha", "alpha", title="design ready")
+    t = storage.load().teams["alpha"]
+    res = approvals.approve(t, review, "ship it")
+    assert res["transition"] == "completed"
+    assert res["priority_raised"] is False
+    assert _priority_of("alpha", review) == 0
+
+
+def test_the_floor_never_lowers_a_hotter_card(alpha):
+    with _conn("alpha") as conn:
+        conn.execute("update tasks set priority = 20 where id = ?",
+                     (alpha["waiting"],))
+        conn.commit()
+    t = storage.load().teams["alpha"]
+    res = approvals.approve(t, alpha["waiting"], "A")
+    assert res["priority"] == 20
+
+
+def test_raise_lane_priority_is_idempotent_and_skips_the_other_lanes(alpha):
+    review = _review_card("alpha", "alpha", title="design ready")
+    assert approvals.raise_lane_priority("alpha") == 2      # needs_input + review
+    assert approvals.raise_lane_priority("alpha") == 0      # already ordered
+    assert _priority_of("alpha", review) == approvals.DECISION_PRIORITY
+    assert _priority_of("alpha", alpha["waiting"]) == approvals.DECISION_PRIORITY
+    assert _priority_of("alpha", alpha["other"]) == 0       # stuck: not a decision
+    assert _priority_of("alpha", alpha["open"]) == 0
+
+
+def test_raise_lane_priority_leaves_another_tenants_cards_alone(alpha):
+    foreign = _card("alpha", tenant="foreign", title="not ours",
+                    block="needs_input", reason="theirs")
+    assert approvals.raise_lane_priority("alpha") == 1
+    assert _priority_of("alpha", foreign) == 0
+
+
+def test_the_floor_has_an_off_switch(alpha, hermes_root):
+    (hermes_root / "config.yaml").write_text(
+        "plugins:\n  entries:\n    hermes-agent-synergia:\n"
+        "      settings:\n        decision_priority: 0\n", encoding="utf-8")
+    t = storage.load().teams["alpha"]
+    res = approvals.approve(t, alpha["waiting"], "A")
+    assert res["priority_raised"] is False
+    assert _priority_of("alpha", alpha["waiting"]) == 0
+    assert approvals.raise_lane_priority("alpha") == 0

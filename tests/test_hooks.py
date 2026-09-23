@@ -785,3 +785,51 @@ def test_review_loop_guard_never_costs_the_giveup_push(_teamhome, monkeypatch):
         board="px-board") is None
     assert pushed == [["t_x"]]
     assert lines == [1]
+
+
+# ── the dispatch tick's priority sweep ───────────────────────────────────────
+#
+# ``request_review`` fires no lifecycle hook, so a card entering the review
+# lane has no entry observer at all. The sweep is the substitute: one UPDATE on
+# a tick that actually moved the board. An idle tick must not pay for it.
+
+def test_an_idle_tick_never_sweeps(_teamhome, monkeypatch):
+    from hermes_agent_synergia import approvals
+
+    def _never(*_a, **_kw):
+        raise AssertionError("an idle tick must not open a board")
+
+    monkeypatch.setattr(approvals, "raise_lane_priority", _never)
+    assert hooks.on_dispatch_tick(result=_FullTick(), board="px-board") is None
+    assert hooks.on_dispatch_tick(result=_FullTick(), board="px-board",
+                                  outcome="idle") is None
+    assert hooks.on_dispatch_tick(result=_FullTick(), board="px-board",
+                                  outcome="skipped_locked") is None
+    # nor without a board to sweep
+    assert hooks.on_dispatch_tick(result=_FullTick(), outcome="ok") is None
+
+
+def test_a_tick_that_moved_the_board_sweeps_it_once(_teamhome, monkeypatch):
+    from hermes_agent_synergia import approvals
+    swept = []
+    monkeypatch.setattr(approvals, "raise_lane_priority",
+                        lambda board, **kw: swept.append(board) or 1)
+    assert hooks.on_dispatch_tick(result=_FullTick(), board="px-board",
+                                  outcome="ok") is None
+    assert swept == ["px-board"]
+
+
+def test_a_failing_sweep_never_costs_the_giveup_push(_teamhome, monkeypatch):
+    from hermes_agent_synergia import approvals
+    pushed = []
+    monkeypatch.setattr(approvals, "on_auto_blocked",
+                        lambda ids, board, **kw: pushed.append(list(ids)) or
+                        {"notified": [], "platforms": []})
+
+    def _boom(*_a, **_kw):
+        raise RuntimeError("tasks table is gone")
+
+    monkeypatch.setattr(approvals, "raise_lane_priority", _boom)
+    assert hooks.on_dispatch_tick(result=_FullTick(auto_blocked=["t_x"]),
+                                  board="px-board", outcome="ok") is None
+    assert pushed == [["t_x"]]

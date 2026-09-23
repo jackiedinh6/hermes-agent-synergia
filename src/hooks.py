@@ -384,7 +384,7 @@ def _fresh(task_ids) -> list:
 def on_dispatch_tick(**kw: Any) -> None:
     """Everything the dispatcher does that no other hook reports.
 
-    Three jobs, each keyed off its own ``DispatchResult`` list:
+    Four jobs. Three are keyed off their own ``DispatchResult`` list:
 
     * ``auto_blocked`` — the stuck lane's push. The circuit breaker writes
       ``status='blocked'`` with a raw UPDATE and fires no
@@ -392,6 +392,10 @@ def on_dispatch_tick(**kw: Any) -> None:
     * ``spawned`` — the review-round loop guard (:func:`_check_review_loop`).
     * ``respawn_guarded`` — why ready work is being held back
       (:func:`_log_suppression`).
+
+    The fourth, :func:`_raise_decision_lane`, is keyed off ``outcome`` instead:
+    a tick that moved the board may have put a card into the review lane,
+    which no hook reports.
 
     This fires once per dispatcher tick — every few seconds, forever — and
     almost always with all three empty, so the cost of the idle case is three
@@ -403,6 +407,7 @@ def on_dispatch_tick(**kw: Any) -> None:
     """
     tick = kw.get("result")
     board = str(kw.get("board") or "")
+    _raise_decision_lane(kw.get("outcome"), board)
     try:
         given_up = getattr(tick, "auto_blocked", None)
         fresh = _fresh([str(tid) for tid in given_up if tid]) if given_up else []
@@ -418,6 +423,28 @@ def on_dispatch_tick(**kw: Any) -> None:
     _check_review_loop(tick, board)
     _log_suppression(tick)
     return None
+
+
+def _raise_decision_lane(outcome, board: str) -> None:
+    """Keep the cards that owe a human decision ahead of the backlog.
+
+    The fourth job, and the only one not keyed off a ``DispatchResult`` list:
+    ``request_review`` fires no hook at all, so a card entering the review
+    lane has no observer of its own to catch it. A tick that actually moved
+    the board is the cheapest signal that one may have appeared. An idle tick
+    — almost every tick — costs one string compare and returns before any
+    import, and the sweep itself is a single set-based UPDATE.
+    """
+    try:
+        if not board or str(outcome or "idle") != "ok":
+            return None
+        from . import approvals
+        raised = approvals.raise_lane_priority(board)
+        if raised:
+            log.info("hermes-agent-synergia: raised %s decision card(s) on %s "
+                     "above the backlog", raised, board)
+    except Exception:                              # noqa: BLE001 — observer
+        return None
 
 
 def _check_review_loop(tick, board: str) -> None:

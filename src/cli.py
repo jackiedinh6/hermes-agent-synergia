@@ -249,6 +249,10 @@ def _setup_parser_impl(p):
                          "(text types only, size-capped)")
     sp.add_argument("--bytes", dest="max_bytes", type=int, default=None,
                     metavar="N", help="Artifact preview cap (default 262144)")
+    sp.add_argument("--summary", dest="summary", action="store_true",
+                    help="With --show: summarize what the card is asking and "
+                         "list the options (one model call per card revision, "
+                         "cached)")
     sp.add_argument("--json", action="store_true")
 
     sp = subs.add_parser(
@@ -3239,6 +3243,32 @@ def _approval_lines(rows: list, now: int, *, with_team: bool) -> list:
     return lines
 
 
+def _summary_lines(summary) -> list:
+    """``--summary``: the briefing and its options, or why there is none."""
+    if not summary:
+        return []
+    state = summary.get("state")
+    if state == "off":
+        return ["  --- summary ---",
+                "    off (settings.approval_summary)"]
+    if state == "error":
+        return ["  --- summary ---",
+                f"    unavailable: {summary.get('error')}"]
+    if state != "ready":
+        return []
+    lines = ["  --- summary ---"]
+    lines.extend("    " + ln for ln in str(summary["summary"]).splitlines())
+    if summary.get("question"):
+        lines.append(f"    decide: {summary['question']}")
+    for n, opt in enumerate(summary.get("options") or [], 1):
+        star = " (recommended)" if opt.get("recommended") else ""
+        lines.append(f"    {n}. [{opt['verb']}] {opt['label']}{star}")
+        lines.extend("       " + ln for ln in str(opt["detail"]).splitlines())
+    for risk in summary.get("risks") or []:
+        lines.append(f"    risk: {risk}")
+    return lines
+
+
 def _detail_lines(t, d: dict) -> list:
     lines = [f"{d['id']}  team={t.slug}  board={t.board}  "
              f"status={d['status']}/{d.get('block_kind') or '-'}",
@@ -3267,6 +3297,7 @@ def _detail_lines(t, d: dict) -> list:
         lines.append("  NOTE: this card is not waiting on a human right now")
     if d.get("block_reason"):
         lines.append(f"  blocked because: {d['block_reason']}")
+    lines.extend(_summary_lines(d.get("summary")))
     if d.get("body"):
         lines.append("  --- body ---")
         lines.extend("  " + ln for ln in str(d["body"]).splitlines())
@@ -3311,6 +3342,11 @@ def _cmd_approvals(args) -> int:
     if args.show:
         t, d = _find_card(args.show, args.team, reg)
         if not args.artifact:
+            # Opt-in: the listing above is read constantly and must stay free,
+            # and this process is too short-lived to amortize a model call.
+            if getattr(args, "summary", False):
+                from . import summarize
+                d["summary"] = summarize.summary(t, d["id"])
             d["_human"] = _detail_lines(t, d)
             _emit(d, json_mode=args.json)
             return 0
@@ -3410,6 +3446,9 @@ def _decision_lines(res: dict) -> list:
     else:
         lines.append(f"  card stays {res['status']!r} (parked); unblock it with: "
                      f"hermes kanban unblock {res['task_id']}")
+    if res.get("priority_raised"):
+        lines.append(f"  priority {res['priority']} — the dispatcher takes "
+                     "this ahead of the backlog")
     return lines
 
 

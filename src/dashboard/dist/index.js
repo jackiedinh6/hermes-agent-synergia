@@ -3368,7 +3368,7 @@
   function DecisionForm(props) {
     const spec = DECISIONS[props.action];
     const prompt = (spec.prompts || {})[props.lane] || spec.prompt;
-    const [text, setText] = hooks.useState("");
+    const [text, setText] = hooks.useState(props.initialText || "");
     const [park, setPark] = hooks.useState(false);
     const [busy, setBusy] = hooks.useState(false);
     const [error, setError] = hooks.useState(null);
@@ -3419,9 +3419,71 @@
     );
   }
 
+  // What the card is asking, in words, with the choices that answer it. Its
+  // own fetch, never the panel's: the approvals poll runs every 5s and must
+  // not cost a model call, so the list carries only `summary_key` (the card
+  // revision) and this asks once per revision for the cards on screen.
+  function SummaryBlock(props) {
+    const row = props.row;
+    const key = row.summary_key || "";
+    const [data, setData] = hooks.useState(null);
+    const [error, setError] = hooks.useState(null);
+    const [nonce, setNonce] = hooks.useState(0);
+
+    hooks.useEffect(function () {
+      if (!key) return undefined;
+      let cancelled = false;
+      setData(null);
+      setError(null);
+      apiGet("/teams/" + encodeURIComponent(props.slug) + "/tasks/" +
+        encodeURIComponent(row.id) + "/summary" + (nonce ? "?refresh=1" : ""))
+        .then(function (d) { if (!cancelled) setData(d || null); },
+              function (err) { if (!cancelled) setError(err); });
+      return function () { cancelled = true; };
+    }, [props.slug, row.id, key, nonce]);
+
+    if (!key) return null;
+    if (error) return h(Muted, null, "No summary for this card.");
+    if (!data) return h(Loading, { label: "Reading the card…" });
+    if (data.state === "off" || data.state === "skipped") return null;
+    if (data.state !== "ready") {
+      return h(Muted, null, "No summary for this card — deciding from the thread below.");
+    }
+
+    const options = data.options || [];
+    return h("div", { className: "ht-brief" },
+      h("p", { className: "ht-brief-text" }, data.summary),
+      data.question ? h("p", { className: "ht-brief-ask" }, data.question) : null,
+      options.length ? h("div", { className: "ht-row ht-brief-options" },
+        options.map(function (opt, i) {
+          return h("button", {
+            key: i,
+            type: "button",
+            className: cn("ht-chip ht-brief-option",
+              opt.recommended && "ht-brief-pick"),
+            disabled: props.readOnly,
+            title: opt.detail,
+            onClick: function () { props.onPick(opt); },
+          }, h("span", { className: "ht-chip-dot" }),
+             DECISIONS[opt.verb].label + ": " + opt.label);
+        })
+      ) : null,
+      (data.risks || []).length
+        ? h(Muted, null, "risks: " + data.risks.join(" · ")) : null,
+      h("div", { className: "ht-row ht-row-end" },
+        h(Muted, null, "drafted from the card — edit before you send"),
+        h(UI.Button, {
+          size: "sm", outlined: true,
+          onClick: function () { setNonce(nonce + 1); },
+        }, "Re-read")
+      )
+    );
+  }
+
   function ApprovalCard(props) {
     const row = props.row;
     const [action, setAction] = hooks.useState(null);
+    const [draft, setDraft] = hooks.useState(null);
     const [openFile, setOpenFile] = hooks.useState(null);
     const attachments = row.attachments || [];
     const lane = laneOf(row);
@@ -3456,6 +3518,15 @@
         h("strong", { className: "ht-run-title" }, row.title || "")
       ),
       why.length ? h("p", { className: "ht-hint" }, why.join("  ")) : null,
+      owesDecision(row) ? h(SummaryBlock, {
+        slug: props.slug, row: row, readOnly: props.readOnly,
+        // Picking an option opens that verb's form with the text already in
+        // it. It never submits: the operator reads it and edits it first.
+        onPick: function (opt) {
+          setDraft({ action: opt.verb, text: opt.detail, n: (draft ? draft.n : 0) + 1 });
+          setAction(opt.verb);
+        },
+      }) : null,
       row.headline ? h("blockquote", { className: "ht-quote" }, row.headline) : null,
       attachments.length ? h("div", { className: "ht-row ht-approval-files" },
         h(Muted, null, "artifacts"),
@@ -3478,10 +3549,16 @@
         onClose: function () { setOpenFile(null); },
       }) : null,
       action ? h(DecisionForm, {
-        key: action, slug: props.slug, task: row, action: action, lane: lane,
+        // The draft counter is in the key so picking a second option refills
+        // an open form instead of leaving the first choice in the textarea.
+        key: action + "/" + (draft && draft.action === action ? draft.n : 0),
+        slug: props.slug, task: row, action: action, lane: lane,
+        initialText: draft && draft.action === action ? draft.text : "",
         readOnly: props.readOnly, onReadOnly: props.onReadOnly,
-        onCancel: function () { setAction(null); },
-        onDone: function (data) { setAction(null); props.onDecided(data); },
+        onCancel: function () { setAction(null); setDraft(null); },
+        onDone: function (data) {
+          setAction(null); setDraft(null); props.onDecided(data);
+        },
       }) : h("div", { className: "ht-row ht-row-end" },
         spec.verbs.map(function (verb) {
           return h(UI.Button, {

@@ -978,6 +978,30 @@ def get_team_task_approval(slug: str, task_id: str):
         return _team_err(exc)
 
 
+@router.get("/teams/{slug}/tasks/{task_id}/summary")
+async def get_team_task_summary(request: Request, slug: str, task_id: str):
+    """What this card is asking, and the choices that answer it.
+
+    Deliberately its own route. The inbox polls every 5s and must never cost a
+    model call, so the lists carry only ``summary_key`` (the card revision) and
+    the briefing is fetched per card, once per revision, by whoever is actually
+    looking at it. ``?refresh=1`` re-asks the model for the same revision.
+
+    A read, so no ``_mutation_guard`` — but a blocking one (SQLite, then the
+    model), so it runs on a worker thread like every other blocking call here.
+    """
+    summarize = _mod("summarize")
+    t, err, _reg, _storage = _team_or_404(slug)
+    if err is not None:
+        return err
+    refresh = (request.query_params.get("refresh") or "").strip() in ("1", "true", "yes")
+    try:
+        return _ok(await _thread(
+            lambda: summarize.summary(t, task_id, refresh=refresh)))
+    except Exception as exc:                                # noqa: BLE001
+        return _team_err(exc)
+
+
 @router.get("/teams/{slug}/attachments/{attachment_id}")
 def get_team_attachment(request: Request, slug: str, attachment_id: int):
     """One artifact, inline. The attachment id is global to the board, so
