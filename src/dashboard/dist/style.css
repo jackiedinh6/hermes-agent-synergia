@@ -245,6 +245,10 @@
   background: color-mix(in srgb, var(--color-card) 82%, transparent);
 }
 .ht-val { font-family: var(--font-mono, ui-monospace, monospace); font-size: .72rem; word-break: break-all; }
+/* Workdir browser: buttons sit in the rows, so centre them on the name. */
+.ht-files td { vertical-align: middle; }
+.ht-file-name { font-family: var(--font-mono, ui-monospace, monospace); font-size: .76rem; word-break: break-all; }
+.ht-file-dir { font-weight: 600; color: #f59e0b; }
 
 /* ── lane hues ────────────────────────────────────────────────────────── */
 .ht-lane-name {

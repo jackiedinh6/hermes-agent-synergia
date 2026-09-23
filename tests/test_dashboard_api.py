@@ -1295,6 +1295,83 @@ def test_task_log_reads_the_worker_log(client, world, profile):
     assert d["truncated"] is True and d["content"] == "line two\n"
 
 
+
+# ── workdir browser ──────────────────────────────────────────────────────────
+
+@pytest.fixture
+def workdir(client, world, profile):
+    profile("qa")
+    _job_done(client, _create_team(client)["job_id"])
+    root = pathlib.Path(_TMP_ROOT[0]) / "work-px"
+    (root / "src").mkdir()
+    (root / "src" / "app.py").write_text("print('hi')\n", encoding="utf-8")
+    (root / "Zeta.md").write_text("# zeta\n", encoding="utf-8")
+    (root / "blob.bin").write_bytes(b"\x00\x01\x02binary")
+    (root / ".env").write_text("SECRET=1\n", encoding="utf-8")
+    return root
+
+
+def test_workdir_files_lists_folders_first_and_hides_credentials(client, workdir):
+    d = client.get(f"{P}/teams/px/files").json()["data"]
+    assert d["workdir"] == str(workdir.resolve())
+    assert (d["path"], d["parent"]) == ("", None)
+    entries = d["entries"]
+    dirs = [e["name"] for e in entries if e["is_directory"]]
+    files = [e["name"] for e in entries if not e["is_directory"]]
+    assert [e["name"] for e in entries] == dirs + files
+    assert "src" in dirs and dirs == sorted(dirs, key=str.lower)
+    assert files == sorted(files, key=str.lower) and ".env" not in files
+    assert {"Zeta.md", "blob.bin"} <= set(files)
+    src = next(e for e in entries if e["name"] == "src")
+    assert (src["path"], src["size"]) == ("src", None)
+
+    sub = client.get(f"{P}/teams/px/files?path=src").json()["data"]
+    assert (sub["path"], sub["parent"]) == ("src", "")
+    assert [(e["path"], e["size"]) for e in sub["entries"]] == [("src/app.py", 12)]
+
+
+def test_workdir_files_refuses_paths_out_of_the_workdir(client, workdir, tmp_path):
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "x.txt").write_text("theirs", encoding="utf-8")
+    (workdir / "escape").symlink_to(outside)
+    for path in ("../work-px", "/etc", "escape", "escape/x.txt", ".env"):
+        for route in ("files", "files/read", "files/download"):
+            r = client.get(f"{P}/teams/px/{route}", params={"path": path})
+            assert r.status_code == 400, (route, path, r.text)
+            assert r.json()["error"]["code"] == "E_TEAM_INVALID"
+
+
+def test_workdir_file_read_previews_text_and_flags_binary(client, workdir):
+    d = client.get(f"{P}/teams/px/files/read?path=src/app.py").json()["data"]
+    assert (d["text"], d["truncated"], d["size"]) == ("print('hi')\n", False, 12)
+    d = client.get(f"{P}/teams/px/files/read?path=src/app.py&tail=5").json()["data"]
+    assert (d["text"], d["truncated"]) == ("print", True)
+    d = client.get(f"{P}/teams/px/files/read?path=blob.bin").json()["data"]
+    assert d["text"] is None and "binary" in d["note"]
+    r = client.get(f"{P}/teams/px/files/read?path=src")
+    assert r.status_code == 404
+    assert r.json()["error"]["code"] == "E_TEAM_NOT_FOUND"
+
+
+def test_workdir_file_download_is_a_data_url(client, workdir):
+    import base64
+    d = client.get(f"{P}/teams/px/files/download?path=blob.bin").json()["data"]
+    assert d["name"] == "blob.bin" and d["size"] == 9
+    head, encoded = d["data_url"].split(",", 1)
+    assert head.startswith("data:") and head.endswith(";base64")
+    assert base64.b64decode(encoded) == b"\x00\x01\x02binary"
+
+
+def test_workdir_files_404_for_unknown_team_or_missing_folder(client, workdir):
+    import shutil
+    r = client.get(f"{P}/teams/ghost/files")
+    assert r.status_code == 404
+    shutil.rmtree(workdir)
+    r = client.get(f"{P}/teams/px/files")
+    assert r.status_code == 404
+    assert r.json()["error"]["code"] == "E_TEAM_NOT_FOUND"
+
 def test_task_run_404s_and_never_mints(client, world, profile):
     from hermes_cli import kanban_db
     profile("qa")

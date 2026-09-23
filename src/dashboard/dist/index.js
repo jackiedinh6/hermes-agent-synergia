@@ -2434,6 +2434,150 @@
     }));
   }
 
+  // A plain <a href> would not carry the session token header, so the file
+  // comes back as a data URL and is saved from here — the host Files tab's way.
+  function downloadDataUrl(dataUrl, name) {
+    const link = document.createElement("a");
+    link.href = dataUrl;
+    link.download = name || "download";
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+  }
+
+  // The host Files page, read-only and rooted at the team's workdir:
+  //   GET /teams/{slug}/files?path=           one folder
+  //   GET /teams/{slug}/files/read?path=      the start of a file, as text
+  //   GET /teams/{slug}/files/download?path=  the whole file, as a data URL
+  // No upload/mkdir/delete — the team's agents write here.
+  function WorkdirFiles(props) {
+    const slug = props.team.slug;
+    const [rel, setRel] = hooks.useState("");
+    const [open, setOpen] = hooks.useState(null);
+    const [downloading, setDownloading] = hooks.useState(null);
+    const [downloadError, setDownloadError] = hooks.useState(null);
+    const base = "/teams/" + encodeURIComponent(slug) + "/files";
+    const poll = usePoll(base + "?path=" + encodeURIComponent(rel), false);
+    // usePoll keeps the previous folder's answer until the next one lands.
+    const listing = poll.data && poll.data.path === rel ? poll.data : null;
+
+    function go(path) {
+      setRel(path);
+      setOpen(null);
+      setDownloadError(null);
+    }
+
+    function download(entry) {
+      setDownloading(entry.path);
+      setDownloadError(null);
+      apiGet(base + "/download?path=" + encodeURIComponent(entry.path)).then(function (d) {
+        setDownloading(null);
+        downloadDataUrl(d.data_url, d.name);
+      }, function (err) {
+        setDownloading(null);
+        setDownloadError(err);
+      });
+    }
+
+    let body;
+    if (poll.error && !listing) {
+      // An unreadable subfolder has no ".." row to leave it by.
+      body = h(React.Fragment, null,
+        h(ErrorNote, { error: poll.error, what: "This folder", onRetry: poll.reload }),
+        rel ? h("div", { className: "ht-row" },
+          h(UI.Button, { size: "sm", outlined: true, onClick: function () { go(""); } },
+            "Back to the workdir root")) : null);
+    } else if (!listing) {
+      body = h(Loading, { label: "Reading the workdir…" });
+    } else {
+      const rows = [];
+      if (listing.parent !== null) {
+        const up = clickableRow("..", false, function () { go(listing.parent); },
+          "Up one folder");
+        rows.push(h("tr", up,
+          h("td", { className: "ht-file-name" }, h(Muted, null, "..")),
+          h("td", null), h("td", null), h("td", null)));
+      }
+      listing.entries.forEach(function (entry) {
+        const selected = !!open && open.path === entry.path;
+        const row = clickableRow(entry.path, selected, function () {
+          if (entry.is_directory) go(entry.path);
+          else setOpen(selected ? null : entry);
+        }, entry.is_directory ? "Open this folder" : "Preview this file");
+        rows.push(h("tr", row,
+          h("td", { className: "ht-file-name" },
+            h("span", { className: entry.is_directory ? "ht-file-dir" : null },
+              entry.name + (entry.is_directory ? "/" : ""))),
+          h("td", { className: "ht-num" }, fmtBytes(entry.size)),
+          h("td", { className: "ht-num" },
+            entry.mtime ? h(Muted, { title: ageOf(entry.mtime) }, stampOf(entry.mtime)) : "—"),
+          h("td", { className: "ht-cell-actions" }, entry.is_directory ? null : h(UI.Button, {
+            size: "sm", ghost: true,
+            disabled: downloading === entry.path,
+            onClick: function (e) { e.stopPropagation(); download(entry); },
+            onKeyDown: function (e) { e.stopPropagation(); },
+          }, downloading === entry.path ? "…" : "Download"))
+        ));
+      });
+      if (!listing.entries.length) {
+        rows.push(h("tr", { key: "empty" },
+          h("td", { colSpan: 4 }, h(Muted, null, "Empty folder"))));
+      }
+      body = h("div", { className: "ht-table-wrap" },
+        h("table", { className: "ht-table ht-files" },
+          h("thead", null, h("tr", null,
+            h("th", null, "Name"),
+            h("th", { className: "ht-num" }, "Size"),
+            h("th", { className: "ht-num" }, "Modified"),
+            h("th", null))),
+          h("tbody", null, rows)));
+    }
+
+    return h("div", { className: "ht-panel" },
+      h("div", { className: "ht-panel-head" },
+        h("code", { className: "ht-code", title: listing ? listing.workdir : null },
+          "./" + rel),
+        h(UI.Button, { size: "sm", outlined: true, onClick: poll.reload }, "Refresh")
+      ),
+      downloadError ? h(ErrorNote, { error: downloadError, what: "This file" }) : null,
+      body,
+      open ? h(WorkdirFileView, {
+        key: open.path, base: base, entry: open,
+        onClose: function () { setOpen(null); },
+      }) : null
+    );
+  }
+
+  function WorkdirFileView(props) {
+    const entry = props.entry;
+    const [data, setData] = hooks.useState(null);
+    const [error, setError] = hooks.useState(null);
+
+    hooks.useEffect(function () {
+      let cancelled = false;
+      apiGet(props.base + "/read?path=" + encodeURIComponent(entry.path)).then(function (d) {
+        if (!cancelled) setData(d || null);
+      }, function (err) {
+        if (!cancelled) setError(err);
+      });
+      return function () { cancelled = true; };
+    }, [props.base, entry.path]);
+
+    return h("div", { className: "ht-log-pane" },
+      h("div", { className: "ht-panel-head" },
+        h("div", { className: "ht-row" },
+          h("strong", null, entry.path),
+          h(Muted, null, fmtBytes(entry.size))
+        ),
+        h(UI.Button, { size: "sm", outlined: true, onClick: props.onClose }, "Close")
+      ),
+      h(PreviewBody, { error: error, data: data, what: "This file", name: entry.name }),
+      data && data.truncated
+        ? h(Muted, null, "Showing the start of the file only — download it for the rest.")
+        : null
+    );
+  }
+
   function WorkdirTab(props) {
     const team = props.team;
     const resolved = team._resolved || {};
@@ -2443,6 +2587,7 @@
     // This one is the operator's: a folder that moves under a queued card is
     // a card that runs somewhere else than it was written for.
     const blocked = busyLanes.length > 0;
+    const [editing, setEditing] = hooks.useState(false);
 
     return h("div", { className: "ht-panel" },
       h("div", { className: "ht-facts" },
@@ -2455,21 +2600,27 @@
           h("code", { className: "ht-code" }, team.workdir || "—"),
           resolved.workdir_exists === false
             ? h(UI.Badge, { tone: "warning", className: "ht-inline-badge" }, "missing") : null,
-          resolved.workdir_is_git_repo
-            ? h(UI.Badge, { tone: "outline", className: "ht-inline-badge" }, "git") : null)
+          h(UI.Button, {
+            size: "sm", outlined: true, className: "ht-inline-badge",
+            disabled: props.readOnly,
+            onClick: function () { setEditing(function (v) { return !v; }); },
+          }, "Change"))
       ),
-      blocked ? h(Note, { tone: "warn", title: "Work is still open" },
+      editing && blocked ? h(Note, { tone: "warn", title: "Work is still open" },
         "Finish or clear " + busyLanes.map(function (lane) {
           return counts[lane] + " " + lane;
         }).join(", ") + " first. Every profile of this team moves with the folder, " +
         "so a card mid-flight would change its ground under it.") : null,
-      h(WorkdirEditor, {
+      editing ? h(WorkdirEditor, {
         team: team, revision: props.revision,
         readOnly: props.readOnly || blocked,
         onReadOnly: props.onReadOnly,
         onChanged: props.onChanged,
-        onClose: props.onClose,
-      })
+        onClose: function () { setEditing(false); },
+      }) : null,
+      // Keyed on the folder so a moved team starts again at its new root.
+      team.workdir && resolved.workdir_exists !== false
+        ? h(WorkdirFiles, { key: team.workdir, team: team }) : null
     );
   }
 
@@ -2484,6 +2635,14 @@
     if (s < 90 * 60) return Math.round(s / 60) + " min";
     const m = Math.round(s / 60);
     return Math.floor(m / 60) + "h " + (m % 60) + "m";
+  }
+
+  function fmtBytes(n) {
+    if (n === null || n === undefined) return "—";
+    if (n < 1024) return n + " B";
+    if (n < 1024 * 1024) return (n / 1024).toFixed(1) + " KB";
+    if (n < 1024 * 1024 * 1024) return (n / (1024 * 1024)).toFixed(1) + " MB";
+    return (n / (1024 * 1024 * 1024)).toFixed(1) + " GB";
   }
 
   function fmtTokens(n) {
@@ -2826,7 +2985,6 @@
         readOnly: props.readOnly, rootRef: props.rootRef,
         onReadOnly: props.onReadOnly,
         onChanged: function () { reload(); props.onRegistryChanged(); },
-        onClose: function () { setTab("chat"); },
       }) : null
     ));
   }
@@ -3145,6 +3303,22 @@
     },
   };
 
+  // The SDK ships no markdown renderer and the dashboard serves its own
+  // assets — a file is read as text, never rendered. `data` is the
+  // approvals.artifact shape, which resolve.workdir_file also answers.
+  function PreviewBody(props) {
+    const data = props.data;
+    if (props.error) return h(ErrorNote, { error: props.error, what: props.what });
+    if (!data) return h(Loading, { label: "Reading " + props.name + "…" });
+    if (data.text === null || data.text === undefined) {
+      return h(Note, { tone: "warn", title: "Not previewable" },
+        (data.note || "This file is not text.") +
+        (data.stored_path ? " " + data.stored_path : ""));
+    }
+    return h("pre", { className: cn("ht-log", props.compact && "ht-artifact-inline") },
+      data.text || "(empty)");
+  }
+
   // `compact` is the thread's inline form, like TaskLogPane's: no panel head,
   // and a shorter pane — a 22 KB design doc must not swallow the timeline.
   function ArtifactView(props) {
@@ -3166,21 +3340,10 @@
       return function () { cancelled = true; };
     }, [props.slug, att.id]);
 
-    // The SDK ships no markdown renderer and the dashboard serves its own
-    // assets — the artifact is read as text, never rendered.
-    let body;
-    if (error) {
-      body = h(ErrorNote, { error: error, what: "This artifact" });
-    } else if (!data) {
-      body = h(Loading, { label: "Reading " + att.filename + "…" });
-    } else if (data.text === null || data.text === undefined) {
-      body = h(Note, { tone: "warn", title: "Not previewable" },
-        (data.note || "This attachment is not text.") +
-        (data.stored_path ? " " + data.stored_path : ""));
-    } else {
-      body = h("pre", { className: cn("ht-log", compact && "ht-artifact-inline") },
-        data.text || "(empty)");
-    }
+    const body = h(PreviewBody, {
+      error: error, data: data, compact: compact,
+      what: "This artifact", name: att.filename,
+    });
 
     const size = Math.ceil((att.size || 0) / 1024) + " KB";
     return h("div", { className: cn("ht-log-pane", compact && "ht-log-pane-inline") },

@@ -999,6 +999,58 @@ def get_team_attachment(request: Request, slug: str, attachment_id: int):
         return _team_err(exc)
 
 
+
+# ── workdir browser: the Workdir tab's read-only file list ──────────────────
+#
+# ``?path=`` is relative to the team's workdir; ``resolve`` refuses ``..``,
+# absolute paths, symlinks out of the folder and credential files.
+
+@router.get("/teams/{slug}/files")
+def get_team_files(request: Request, slug: str):
+    resolve = _mod("resolve")
+    t, err, _reg, _storage = _team_or_404(slug)
+    if err is not None:
+        return err
+    try:
+        return _ok(resolve.workdir_listing(
+            t, request.query_params.get("path") or ""))
+    except Exception as exc:                                # noqa: BLE001
+        return _team_err(exc)
+
+
+@router.get("/teams/{slug}/files/read")
+def get_team_file(request: Request, slug: str):
+    """The start of one file as text; ``?tail=`` caps the bytes."""
+    resolve = _mod("resolve")
+    t, err, _reg, _storage = _team_or_404(slug)
+    if err is not None:
+        return err
+    try:
+        tail = int(request.query_params.get("tail")
+                   or resolve.WORKDIR_PREVIEW_DEFAULT)
+    except ValueError:
+        tail = resolve.WORKDIR_PREVIEW_DEFAULT
+    try:
+        return _ok(resolve.workdir_file(
+            t, request.query_params.get("path") or "", max_bytes=tail))
+    except Exception as exc:                                # noqa: BLE001
+        return _team_err(exc)
+
+
+@router.get("/teams/{slug}/files/download")
+def get_team_file_download(request: Request, slug: str):
+    """One file as a data URL — a plain link would not carry the session
+    token header, so the page saves it itself, like the host Files tab."""
+    resolve = _mod("resolve")
+    t, err, _reg, _storage = _team_or_404(slug)
+    if err is not None:
+        return err
+    try:
+        return _ok(resolve.workdir_download(
+            t, request.query_params.get("path") or ""))
+    except Exception as exc:                                # noqa: BLE001
+        return _team_err(exc)
+
 async def _decision_route(request: Request, slug: str, task_id: str,
                           *, action: str):
     """Shared body of approve/reject/release: guard, confirm token, then the

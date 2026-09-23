@@ -858,6 +858,149 @@ def observe(team: "model.Team") -> Observed:
     )
 
 
+# ── workdir browser (the dashboard's Workdir tab) ───────────────────────────
+#
+# Read-only and confined to the team's own folder: the host Files API can be
+# locked to another root (HERMES_DASHBOARD_FILES_ROOT, /opt/data) and would let
+# the operator walk above the workdir.
+
+WORKDIR_PREVIEW_DEFAULT = 256 * 1024
+WORKDIR_PREVIEW_MAX = 2_000_000
+WORKDIR_DOWNLOAD_MAX = 25 * 1024 * 1024
+
+# Mirrors the host Files guard (hermes_cli/web_routers/files.py
+# _is_sensitive_path) so both browsers hide the same credential material.
+_SENSITIVE_WORKDIR_NAMES = frozenset({
+    "auth.json", "auth.lock", "credentials", "config.yaml", ".anthropic_oauth.json",
+    "google_token.json", "google_oauth_pending.json", "google_oauth.json",
+    "webhook_subscriptions.json", "bws_cache.json", "bws_cache.enc.json",
+    ".git-credentials",
+})
+_SENSITIVE_WORKDIR_DIRS = frozenset({"mcp-tokens", "pairing"})
+
+
+def _is_sensitive_workdir_path(parts) -> bool:
+    lowered = [str(p).lower() for p in parts]
+    if not lowered:
+        return False
+    name = lowered[-1]
+    if name == ".env" or name.startswith(".env.") or name == ".envrc":
+        return True
+    if name in _SENSITIVE_WORKDIR_NAMES:
+        return True
+    return any(p in _SENSITIVE_WORKDIR_DIRS for p in lowered)
+
+
+def _workdir_refusal(team, message: str) -> TeamError:
+    return TeamError(
+        E_TEAM_INVALID, message,
+        hint="path is relative to the team's workdir, e.g. 'src/app.py'; "
+             "'' is the workdir itself",
+        remedy=f"hermes team show {team.slug}")
+
+
+def _workdir_target(team, rel: str) -> tuple[Path, Path, str]:
+    """``(root, target, rel)`` for *rel* inside *team*'s workdir, or a refusal.
+
+    Resolved before the containment check, so a symlink pointing out of the
+    workdir is refused like ``..`` is."""
+    from pathlib import PurePosixPath
+    raw = os.path.expanduser(team.workdir or "")
+    if not raw or not os.path.isdir(raw):
+        raise TeamError(
+            E_TEAM_NOT_FOUND, f"workdir {team.workdir!r} does not exist",
+            hint="The team's root folder is missing on disk.",
+            remedy=f"hermes team set-workdir {team.slug} <dir> --apply")
+    root = Path(raw).resolve()
+    text = (rel or "").strip()
+    if "\0" in text or text.startswith("/") or text.startswith("\\"):
+        raise _workdir_refusal(team, f"invalid path {rel!r}")
+    parts = [p for p in PurePosixPath(text).parts if p not in ("", ".")]
+    if ".." in parts:
+        raise _workdir_refusal(team, f"path {rel!r} may not contain '..'")
+    if _is_sensitive_workdir_path(parts):
+        raise _workdir_refusal(team, f"{rel!r} holds credentials and is not shown")
+    try:
+        target = root.joinpath(*parts).resolve()
+    except (OSError, RuntimeError):
+        raise _workdir_refusal(team, f"invalid path {rel!r}")
+    if target != root and root not in target.parents:
+        raise _workdir_refusal(team, f"{rel!r} is outside the workdir")
+    return root, target, "/".join(parts)
+
+
+def _workdir_regular_file(team, rel: str) -> tuple[Path, str, os.stat_result]:
+    _root, target, rel = _workdir_target(team, rel)
+    if not target.is_file():
+        raise TeamError(
+            E_TEAM_NOT_FOUND, f"no file {rel!r} in the workdir",
+            hint="Pick a file from the workdir listing.",
+            remedy=f"hermes team show {team.slug}")
+    return target, rel, target.stat()
+
+
+def workdir_listing(team, rel: str = "") -> dict:
+    """One folder of *team*'s workdir, folders first — the host Files order."""
+    root, target, rel = _workdir_target(team, rel)
+    if not target.is_dir():
+        raise _workdir_refusal(team, f"{rel!r} is not a folder")
+    entries = []
+    with os.scandir(target) as scan:
+        for entry in scan:
+            path = f"{rel}/{entry.name}" if rel else entry.name
+            if _is_sensitive_workdir_path(path.split("/")):
+                continue
+            try:
+                is_dir = entry.is_dir()
+                st = entry.stat()
+                size, mtime = (None if is_dir else st.st_size), st.st_mtime
+            except OSError:
+                # A dangling symlink is still listed; only its numbers are gone.
+                is_dir, size, mtime = False, None, None
+            entries.append({"name": entry.name, "path": path,
+                            "is_directory": is_dir, "size": size,
+                            "mtime": mtime})
+    entries.sort(key=lambda e: (not e["is_directory"], e["name"].lower()))
+    parent = None if not rel else rel.rpartition("/")[0]
+    return {"workdir": str(root), "path": rel, "parent": parent,
+            "entries": entries}
+
+
+def workdir_file(team, rel: str, *,
+                 max_bytes: int = WORKDIR_PREVIEW_DEFAULT) -> dict:
+    """The start of one workdir file as text — the ``approvals.artifact``
+    shape, so the dashboard renders both the same way."""
+    max_bytes = max(1, min(int(max_bytes or WORKDIR_PREVIEW_DEFAULT),
+                           WORKDIR_PREVIEW_MAX))
+    target, rel, st = _workdir_regular_file(team, rel)
+    with target.open("rb") as handle:
+        raw = handle.read(max_bytes)
+    out = {"name": target.name, "path": rel, "size": st.st_size,
+           "mtime": st.st_mtime, "text": None,
+           "truncated": st.st_size > len(raw), "note": None}
+    if b"\0" in raw[:8192]:
+        out["note"] = "binary file — not previewable; download it"
+        out["truncated"] = False
+        return out
+    out["text"] = raw.decode("utf-8", errors="replace")
+    return out
+
+
+def workdir_download(team, rel: str) -> dict:
+    """One workdir file as a data URL — the host Files download path."""
+    import base64
+    import mimetypes
+    target, rel, st = _workdir_regular_file(team, rel)
+    if st.st_size > WORKDIR_DOWNLOAD_MAX:
+        raise _workdir_refusal(
+            team, f"{rel!r} is {st.st_size} bytes — too large to download "
+                  f"here (cap {WORKDIR_DOWNLOAD_MAX}); read it on disk")
+    mime = mimetypes.guess_type(target.name)[0] or "application/octet-stream"
+    encoded = base64.b64encode(target.read_bytes()).decode("ascii")
+    return {"name": target.name, "path": rel, "size": st.st_size,
+            "mime_type": mime, "data_url": f"data:{mime};base64,{encoded}"}
+
+
 def workdir_has_commit(workdir: str) -> bool:
     # The dispatcher branches every worktree task off HEAD
     # (`git worktree add -b wt/<id> <path> HEAD`), so a bare `git init` with
