@@ -2793,18 +2793,27 @@
     const status = !p.ahead
       ? h(React.Fragment, null, "In ", code(p.base), " · files in ", code(p.workdir))
       : h(React.Fragment, null,
-        p.ahead + (p.ahead === 1 ? " commit" : " commits") + " ahead of ", code(p.base),
+        p.ahead + (p.ahead === 1 ? " commit" : " commits") +
+        (p.merged ? " into " : " ahead of "), code(p.base),
         p.blocker ? " — " + p.blocker.message : null);
 
     return h("div", { className: cn("ht-note", !p.ahead ? "ht-note-ok" : p.blocker ? "ht-note-warn" : "ht-note-info") },
       h("strong", null, "Result: ", code(p.branch)),
       h("p", null, p.title),
       h("p", { title: commits || undefined }, status),
+      (p.heads || []).length > 1 ? p.heads.map(function (x) {
+        const how = x.merged ? "merged"
+          : x.strategy === "in-base" ? "already in " + p.base
+            : x.blocker ? "conflict"
+              : x.strategy === "ff" ? "fast-forward" : "merge commit";
+        return h("p", { className: "ht-hint", key: x.card },
+          code(x.branch), " — " + x.title + " (" + how + ")");
+      }) : null,
       (p.others || []).length ? h("p", { className: "ht-hint" }, "Not included: ",
         p.others.map(function (o, i) {
           return h(React.Fragment, { key: o.card }, i ? ", " : null, code(o.branch), " (" + o.title + ")");
         })) : null,
-      p.ahead && p.blocker ? h("code", { className: "ht-remedy" }, p.blocker.remedy) : null,
+      p.blocker ? h("code", { className: "ht-remedy" }, p.blocker.remedy) : null,
       actionError ? h(ErrorNote, { error: actionError, what: "The merge" }) : null,
       p.ahead && !p.blocker ? h("div", { className: "ht-row ht-row-end" },
         h(UI.Button, { size: "sm", disabled: props.readOnly || busy, onClick: merge },

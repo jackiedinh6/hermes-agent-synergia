@@ -1964,7 +1964,8 @@ def test_merge_preview_is_a_read_and_apply_a_guarded_write(client, world,
     r = client.get(path)
     assert r.status_code == 200, r.text
     d = r.json()["data"]
-    assert d["card"] == th.ids["step2"] and d["ahead"] == 2
+    assert d["card"] == th.ids["step2"] and d["ahead"] == 3
+    assert [h["strategy"] for h in d["heads"]] == ["ff", "merge"]
     assert "_human" not in d
     assert client.get(f"{P}/teams/rt/tasks/t_nope/merge").status_code == 404
     _writes_off(world)
@@ -1977,7 +1978,8 @@ def test_merge_preview_is_a_read_and_apply_a_guarded_write(client, world,
     r = client.post(path, json={})
     assert r.status_code == 200, r.text
     assert r.json()["data"]["merged"] is True
-    assert th.git("rev-parse", "HEAD") == th.git("rev-parse", "wt/step2")
+    assert (th.workdir / "design.md").is_file()
+    assert (th.workdir / "step2.py").is_file()
 
 
 def test_thread_report_reads_the_whole_thread(client, world, result_thread):

@@ -1343,24 +1343,34 @@ def auto_merge_enabled() -> bool:
 
 
 def merge_comment(res: dict) -> str:
-    """The root-card line for a :func:`resolve.merge_result` that merged."""
+    """The root-card line for a :func:`resolve.merge_result` that merged at
+    least one head."""
     n = res["ahead"]
     body = (f"Merged `{res['branch']}` into `{res['base']}` "
             f"(`{res['to'][:12]}`, {n} commit{'' if n == 1 else 's'}). "
             f"Files: `{res['workdir']}`.")
+    landed = [h for h in (res.get("heads") or []) if h["merged"]]
+    if len(landed) > 1:
+        body += " Heads: " + ", ".join(
+            f"`{h['branch']}` ({h['card']})" for h in landed) + "."
     if res["others"]:
         body += " Not included: " + ", ".join(
             f"`{o['branch']}` ({o['card']})" for o in res["others"]) + "."
+    if res["blocker"]:
+        body += (f" Stopped: {res['blocker']['message']}. Finish by hand with "
+                 f"`{res['blocker']['remedy']}`, then "
+                 f"`hermes team merge {res['team']} {res['root']}` shows what "
+                 "is left.")
     return body
 
 
 def on_completed(task_id: str, board: str, reg=None) -> dict:
     """``kanban_task_completed`` body: once every card of a worktree team's
-    thread is done, fast-forward the workdir to the thread's result branch
+    thread is done, land every head of the thread on the workdir's branch
     (:func:`resolve.merge_result`) and say so on the root card.
 
-    Anything short of a clean fast-forward is left to a human, with one
-    comment on the root card naming why and what to run. A refusal that a
+    A conflict is left to a human: the heads before it stay merged and the
+    comment names the branch and what to run. A refusal that a
     parallel completion already made moot — its merge landed the result —
     stays silent."""
     from hermes_cli import kanban_db, kanban_db_connect

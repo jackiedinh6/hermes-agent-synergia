@@ -2352,13 +2352,21 @@ def _merge_lines(res: dict) -> list:
     else:
         lines.append(f"  {n} commit(s) ahead of {res['base']}")
     lines += [f"    {c['sha']} {c['subject']}" for c in res["commits"]]
-    if not res["merged"] and n:
-        if res["blocker"]:
-            lines.append(f"  blocked: {res['blocker']['message']}")
-            lines.append(f"  remedy: {res['blocker']['remedy']}")
-        else:
-            lines.append(f"  apply with: hermes team merge {res['team']} "
-                         f"{res['root']} --apply")
+    how_of = {"ff": "fast-forward", "merge": "merge commit",
+              "in-base": "already in"}
+    for h in res.get("heads") or []:
+        how = how_of.get(h["strategy"], h["strategy"])
+        state = "merged" if h["merged"] else \
+            ("blocked" if h["blocker"] else
+             ("" if h["strategy"] == "in-base" else "pending"))
+        lines.append(f"  head {h['branch']} — {h['card']}: {h['title']} "
+                     f"({how}{', ' + state if state else ''})")
+    if res["blocker"]:
+        lines.append(f"  blocked: {res['blocker']['message']}")
+        lines.append(f"  remedy: {res['blocker']['remedy']}")
+    elif not res["merged"] and n:
+        lines.append(f"  apply with: hermes team merge {res['team']} "
+                     f"{res['root']} --apply")
     lines += [f"  not included: {o['branch']} — {o['card']}: {o['title']}"
               for o in res["others"]]
     lines.append(f"  files: {res['workdir']}")
@@ -2367,7 +2375,7 @@ def _merge_lines(res: dict) -> list:
 
 def _merge_impl(slug: str, card: str, *, apply: bool = False) -> dict:
     """merge core, shared with ``/teams/{slug}/tasks/{card}/merge``: preview
-    or fast-forward the workdir to the result branch of *card*'s thread
+    or land every finished head of *card*'s thread on the workdir
     (:func:`resolve.merge_result`). Raises TeamError."""
     from . import approvals, resolve
     team = approvals.team_or_raise(slug)

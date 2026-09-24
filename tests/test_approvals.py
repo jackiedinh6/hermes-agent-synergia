@@ -1262,11 +1262,13 @@ def test_last_card_done_merges_the_result_and_says_so_once(tmp_path,
     _worktree_team("omega", th.workdir)
     res = approvals.on_completed(th.ids["step2"], "omega")
     assert res["merged"] is True and res["root"] == th.ids["root"]
-    assert th.git("rev-parse", "HEAD") == th.git("rev-parse", "wt/step2")
+    assert (th.workdir / "design.md").is_file()
+    assert (th.workdir / "step2.py").is_file()
     [(author, body)] = _comments_of("omega", th.ids["root"])
     assert author == approvals.AUTO_MERGE_AUTHOR
     assert body.startswith("Merged `wt/step2` into `master`")
-    assert "Not included: `wt/design`" in body
+    assert "Heads: `wt/design`" in body and "`wt/step2`" in body
+    assert "Not included" not in body
     # a parallel completion that finds the result already in stays silent
     assert approvals.on_completed(th.ids["design"], "omega")["merged"] is False
     assert len(_comments_of("omega", th.ids["root"])) == 1
@@ -1297,6 +1299,23 @@ def test_auto_merge_refusal_leaves_the_checkout_and_names_the_fix(
     assert th.git("rev-parse", "HEAD") == th.start
     [(_author, body)] = _comments_of("omega", th.ids["root"])
     assert body.startswith("Auto-merge skipped:")
+    assert f"hermes team merge omega {th.ids['root']}" in body
+
+
+def test_auto_merge_keeps_what_landed_and_names_the_conflict(tmp_path,
+                                                            result_thread):
+    th = result_thread(tmp_path / "work", "omega", "omega")
+    _worktree_team("omega", th.workdir)
+    (th.workdir / "step2.py").write_text("operator\n", encoding="utf-8")
+    th.git("add", "-A")
+    th.git("commit", "-q", "-m", "operator wrote step2 first")
+    res = approvals.on_completed(th.ids["step2"], "omega")
+    assert res["merged"] is True and res["skipped"] is None
+    assert (th.workdir / "design.md").is_file()          # the first head landed
+    [(_author, body)] = _comments_of("omega", th.ids["root"])
+    assert body.startswith("Merged `wt/design` into `master`")
+    assert "Not included: `wt/step2`" in body
+    assert "Stopped: wt/step2" in body
     assert f"hermes team merge omega {th.ids['root']}" in body
 
 

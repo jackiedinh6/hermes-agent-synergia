@@ -549,10 +549,15 @@ def test_merge_previews_by_default_and_applies_with_the_flag(parser, capsys, W,
                           capsys=capsys)
     assert code == 0
     assert env["data"]["card"] == th.ids["step2"]
-    assert env["data"]["dry_run"] is True and env["data"]["ahead"] == 2
+    assert env["data"]["dry_run"] is True and env["data"]["ahead"] == 3
+    assert [h["branch"] for h in env["data"]["heads"]] == ["wt/design",
+                                                           "wt/step2"]
     assert th.git("rev-parse", "HEAD") == th.start
     code, _env, err = run(parser, "merge", "rt", th.ids["root"], "--apply",
                           capsys=capsys)
     assert code == 0
-    assert "merged 2 commit(s) into master" in err
-    assert th.git("rev-parse", "HEAD") == th.git("rev-parse", "wt/step2")
+    assert "merged 4 commit(s) into master" in err
+    assert "head wt/design — " in err and "(merged)" not in err
+    assert "fast-forward, merged" in err and "merge commit, merged" in err
+    assert (th.workdir / "design.md").is_file()
+    assert (th.workdir / "step2.py").is_file()

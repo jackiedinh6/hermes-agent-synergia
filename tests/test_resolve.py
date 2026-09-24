@@ -168,30 +168,112 @@ def test_ensure_worktree_repo_failure_is_team_error(tmp_path):
 
 # ── merge_result: a finished thread's result branch ─────────────────────────
 
-def test_merge_result_fast_forwards_to_the_newest_head(world, result_thread):
+def _status(wd) -> str:
+    return subprocess.run(["git", "-C", str(wd), "status", "--porcelain"],
+                          capture_output=True, text=True, check=True).stdout
+
+
+def test_merge_result_lands_every_head_oldest_first(world, result_thread):
     th = result_thread(world.workdir, "proj-board", "proj")
     preview = resolve.merge_result(world.team, th.ids["root"])
-    assert preview["card"] == th.ids["step2"]
-    assert preview["ahead"] == 2 and preview["merged"] is False
-    assert [o["branch"] for o in preview["others"]] == ["wt/design"]
+    assert [h["branch"] for h in preview["heads"]] == ["wt/design", "wt/step2"]
+    assert [h["strategy"] for h in preview["heads"]] == ["ff", "merge"]
+    assert [h["ahead"] for h in preview["heads"]] == [1, 2]   # no double count
+    assert preview["ahead"] == 3 and preview["merged"] is False
+    assert preview["others"] == [] and preview["blocker"] is None
     assert th.git("rev-parse", "HEAD") == th.start
     # any card of the thread names it
     done = resolve.merge_result(world.team, th.ids["design"], apply=True)
-    assert done["merged"] is True
-    assert th.git("rev-parse", "HEAD") == th.git("rev-parse", "wt/step2")
+    assert done["merged"] is True and done["blocker"] is None
+    assert all(h["merged"] for h in done["heads"])
+    assert done["card"] == th.ids["step2"]                    # the last landed
+    assert (world.workdir / "design.md").is_file()
     assert (world.workdir / "step2.py").is_file()
-    assert not (world.workdir / "design.md").exists()
+    assert done["ahead"] == 4                                 # 3 + merge commit
+    assert th.git("log", "-1", "--format=%s") == \
+        f"hermes-agent-synergia: merge wt/step2 ({th.ids['step2']})"
     again = resolve.merge_result(world.team, th.ids["root"], apply=True)
     assert again["ahead"] == 0 and again["merged"] is False
+    assert {h["strategy"] for h in again["heads"]} == {"in-base"}
 
 
-@pytest.mark.parametrize("change", ["commit", "edit"])
-def test_merge_result_only_fast_forwards_a_clean_checkout(world, result_thread,
-                                                          change):
+def test_merge_result_skips_a_head_the_base_already_holds(world, result_thread):
+    th = result_thread(world.workdir, "proj-board", "proj")
+    th.git("merge", "--ff-only", "-q", "wt/design")
+    preview = resolve.merge_result(world.team, th.ids["root"])
+    strategy = {h["branch"]: h["strategy"] for h in preview["heads"]}
+    assert strategy == {"wt/design": "in-base", "wt/step2": "merge"}
+    assert preview["ahead"] == 2
+    done = resolve.merge_result(world.team, th.ids["root"], apply=True)
+    assert done["merged"] is True and done["card"] == th.ids["step2"]
+
+
+def test_merge_result_stops_at_a_conflict_and_keeps_what_landed(world,
+                                                                result_thread):
+    th = result_thread(world.workdir, "proj-board", "proj")
+    (world.workdir / "step2.py").write_text("operator\n")     # add/add vs wt/step2
+    th.git("add", "-A")
+    th.git("commit", "-q", "-m", "operator wrote step2 first")
+    head = th.git("rev-parse", "HEAD")
+    res = resolve.merge_result(world.team, th.ids["root"], apply=True)
+    assert res["merged"] is True                               # wt/design landed
+    assert (world.workdir / "design.md").is_file()
+    assert [o["branch"] for o in res["others"]] == ["wt/step2"]
+    assert "wt/step2" in res["blocker"]["message"]
+    assert res["blocker"]["remedy"].endswith("merge wt/step2")
+    landed = {h["branch"]: h["merged"] for h in res["heads"]}
+    assert landed == {"wt/design": True, "wt/step2": False}
+    assert _status(world.workdir) == ""                         # the abort worked
+    assert (world.workdir / "step2.py").read_text() == "operator\n"
+    assert th.git("rev-parse", "HEAD~1") == head
+
+
+def test_merge_result_raises_when_no_head_lands(world, result_thread):
+    th = result_thread(world.workdir, "proj-board", "proj")
+    (world.workdir / "design.md").write_text("operator\n")
+    th.git("add", "-A")
+    th.git("commit", "-q", "-m", "operator wrote the design first")
+    head = th.git("rev-parse", "HEAD")
+    assert resolve.merge_result(world.team, th.ids["root"])["blocker"]
+    with pytest.raises(TeamError) as ei:
+        resolve.merge_result(world.team, th.ids["root"], apply=True)
+    assert ei.value.code == "E_TEAM_INVALID"
+    assert "wt/design" in ei.value.message
+    assert th.git("rev-parse", "HEAD") == head
+    assert _status(world.workdir) == ""
+
+
+def test_merge_result_merge_commit_falls_back_to_a_plugin_identity(
+        world, result_thread, monkeypatch):
+    th = result_thread(world.workdir, "proj-board", "proj")
+    for var in ("GIT_AUTHOR_EMAIL", "GIT_COMMITTER_EMAIL", "GIT_AUTHOR_NAME",
+                "GIT_COMMITTER_NAME", "EMAIL"):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", "/dev/null")
+    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
+    assert resolve.merge_result(world.team, th.ids["root"],
+                               apply=True)["merged"] is True
+    assert th.git("log", "-1", "--format=%ae").splitlines()[0] == \
+        "hermes-agent-synergia@localhost"
+
+
+def test_merge_result_merges_a_base_that_moved_on(world, result_thread):
     th = result_thread(world.workdir, "proj-board", "proj")
     (world.workdir / "README.md").write_text("operator\n")
-    if change == "commit":
-        th.git("commit", "-q", "-am", "operator change")
+    th.git("commit", "-q", "-am", "operator change")
+    preview = resolve.merge_result(world.team, th.ids["root"])
+    assert [h["strategy"] for h in preview["heads"]] == ["merge", "merge"]
+    assert preview["blocker"] is None
+    done = resolve.merge_result(world.team, th.ids["root"], apply=True)
+    assert done["merged"] is True and done["others"] == []
+    assert (world.workdir / "design.md").is_file()
+    assert (world.workdir / "step2.py").is_file()
+    assert (world.workdir / "README.md").read_text() == "operator\n"
+
+
+def test_merge_result_refuses_a_dirty_checkout(world, result_thread):
+    th = result_thread(world.workdir, "proj-board", "proj")
+    (world.workdir / "README.md").write_text("operator\n")
     head = th.git("rev-parse", "HEAD")
     assert resolve.merge_result(world.team, th.ids["root"])["blocker"]
     with pytest.raises(TeamError) as ei:
