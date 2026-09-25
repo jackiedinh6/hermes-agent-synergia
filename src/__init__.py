@@ -54,8 +54,9 @@ def register(ctx):
     ctx.register_hook("kanban_task_blocked", hooks.on_task_blocked)
 
     # The substrate never merges a worktree card's branch: when a thread's
-    # last card finishes, fast-forward the workdir to its result. Settings
-    # key `auto_merge`; false leaves it to `hermes team merge`.
+    # last card finishes, fast-forward the workdir to its result, then retire
+    # each card's worktree onto a step-named branch. Settings key
+    # `auto_merge`; false leaves it to `hermes team merge`.
     ctx.register_hook("kanban_task_completed", hooks.on_task_completed)
 
     # The stuck lane's push: the dispatcher's circuit breaker blocks a card

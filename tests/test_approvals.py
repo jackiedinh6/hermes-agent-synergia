@@ -1266,9 +1266,13 @@ def test_last_card_done_merges_the_result_and_says_so_once(tmp_path,
     assert (th.workdir / "step2.py").is_file()
     [(author, body)] = _comments_of("omega", th.ids["root"])
     assert author == approvals.AUTO_MERGE_AUTHOR
-    assert body.startswith("Merged `wt/step2` into `master`")
-    assert "Heads: `wt/design`" in body and "`wt/step2`" in body
+    assert body.startswith("Merged `step-step2` (was `wt/step2`) into `master`")
+    assert "Heads: `step-design` (was `wt/design`)" in body
+    assert "`step-step2` (was `wt/step2`)" in body
     assert "Not included" not in body
+    # every card of the thread is retired onto its step branch
+    assert sorted(th.git("branch", "--format=%(refname:short)").split()) == \
+        ["master", "step-design", "step-root", "step-step1", "step-step2"]
     # a parallel completion that finds the result already in stays silent
     assert approvals.on_completed(th.ids["design"], "omega")["merged"] is False
     assert len(_comments_of("omega", th.ids["root"])) == 1
@@ -1313,8 +1317,9 @@ def test_auto_merge_keeps_what_landed_and_names_the_conflict(tmp_path,
     assert res["merged"] is True and res["skipped"] is None
     assert (th.workdir / "design.md").is_file()          # the first head landed
     [(_author, body)] = _comments_of("omega", th.ids["root"])
-    assert body.startswith("Merged `wt/design` into `master`")
-    assert "Not included: `wt/step2`" in body
+    assert body.startswith("Merged `step-design` (was `wt/design`) into `master`")
+    assert "Not included: `wt/step2`" in body       # unmerged, so not retired
+    assert "Kept: " in body and "`wt/step2` (branch is not merged yet)" in body
     assert "Stopped: wt/step2" in body
     assert f"hermes team merge omega {th.ids['root']}" in body
 

@@ -27,13 +27,13 @@ _NOTICES = [r for r in _RESULTS if not r.asserted]
 
 
 def test_probe_surface_intact():
-    """S1 pins the probe at exactly 52 asserted checks — it must not drift
+    """S1 pins the probe at exactly 53 asserted checks — it must not drift
     silently in either direction (drop coverage, or pad the count). 43 through
     the approvals inbox, plus five attachment-substrate rows, the
-    worker-exit guard's two, the pause/resume surface and the auto-merge
-    hook."""
-    assert len(_ASSERTED) == 52, (
-        f"probe surface drifted: {len(_ASSERTED)} asserted, S1 pins 52")
+    worker-exit guard's two, the pause/resume surface, the auto-merge hook and
+    the branch-rename writer a retired worktree needs."""
+    assert len(_ASSERTED) == 53, (
+        f"probe surface drifted: {len(_ASSERTED)} asserted, S1 pins 53")
 
 
 def _boom():

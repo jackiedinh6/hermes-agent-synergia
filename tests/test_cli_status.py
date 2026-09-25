@@ -313,3 +313,41 @@ def test_status_human_names_the_verb_for_a_parked_lane(alpha, parser, capsys):
     out = capsys.readouterr()
     assert code == 0
     assert "--kind triage" in out.err
+
+
+# ── `team merge` human lines: what each card was retired to ──────────────────
+
+def _merge_payload(**kw) -> dict:
+    res = {"team": "alpha", "workdir": "/w", "root": "t_root",
+           "card": "t_2", "title": "step 2", "branch": "wt/t_2",
+           "base": "master", "from": "a" * 40, "to": "b" * 40, "ahead": 2,
+           "commits": [], "others": [], "heads": [], "blocker": None,
+           "finished": [], "merged": True, "dry_run": False}
+    res.update(kw)
+    return res
+
+
+def _finished(branch, **kw) -> dict:
+    row = {"card": "t_2", "title": "step 2", "branch": branch,
+           "renamed_to": None, "worktree": None, "removed": False,
+           "note": None}
+    row.update(kw)
+    return row
+
+
+def test_merge_lines_name_each_retired_card():
+    lines = cli._merge_lines(_merge_payload(finished=[
+        _finished("wt/t_1", renamed_to="step-1-scaffold",
+                  worktree="/w/.worktrees/t_1", removed=True),
+        _finished("wt/t_2", note="worktree has uncommitted changes"),
+        _finished("step-0-seed")]))          # already retired: nothing to say
+    assert "  finished wt/t_1 -> step-1-scaffold (worktree removed)" in lines
+    assert "  kept wt/t_2: worktree has uncommitted changes" in lines
+    assert not [ln for ln in lines if "step-0-seed" in ln]
+
+
+def test_merge_preview_lines_say_would_finish():
+    lines = cli._merge_lines(_merge_payload(
+        merged=False, dry_run=True,
+        finished=[_finished("wt/t_2", renamed_to="step-2-cache")]))
+    assert "  would finish wt/t_2 -> step-2-cache" in lines

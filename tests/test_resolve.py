@@ -284,6 +284,141 @@ def test_merge_result_refuses_a_dirty_checkout(world, result_thread):
 
 
 
+# ── finish_worktrees: a step-named branch, and the worktree gone ────────────
+
+def _branches(wd) -> list:
+    return sorted(subprocess.run(
+        ["git", "-C", str(wd), "branch", "--format=%(refname:short)"],
+        capture_output=True, text=True, check=True).stdout.split())
+
+
+def _worktree_paths(wd) -> list:
+    """Every LINKED worktree of *wd* (the main checkout left out)."""
+    out = subprocess.run(["git", "-C", str(wd), "worktree", "list", "--porcelain"],
+                         capture_output=True, text=True, check=True).stdout
+    paths = [ln[len("worktree "):] for ln in out.splitlines()
+             if ln.startswith("worktree ")]
+    return sorted(p for p in paths if p != str(wd))
+
+
+def _branch_of(board, card_id) -> str:
+    from hermes_cli import kanban_db, kanban_db_connect
+    with kanban_db_connect.connect_closing(
+            db_path=kanban_db.kanban_db_path(board)) as conn:
+        return kanban_db.get_task(conn, card_id).branch_name
+
+
+def test_merge_retires_every_done_card_and_its_worktree(world, result_thread):
+    th = result_thread(world.workdir, "proj-board", "proj",
+                       worktrees=("design", "step1", "step2"))
+    assert len(_worktree_paths(world.workdir)) == 3
+    res = resolve.merge_result(world.team, th.ids["root"], apply=True)
+    assert res["merged"] is True
+    # the fixture titles carry no step number, so the slug stands alone
+    assert _branches(world.workdir) == ["master", "step-design", "step-root",
+                                        "step-step1", "step-step2"]
+    assert _worktree_paths(world.workdir) == []
+    rows = {r["branch"]: r for r in res["finished"]}
+    assert set(rows) == {"wt/root", "wt/design", "wt/step1", "wt/step2"}
+    assert rows["wt/step2"]["renamed_to"] == "step-step2"
+    assert rows["wt/step2"]["removed"] is True
+    assert rows["wt/root"]["removed"] is False          # it never had one
+    assert all(r["note"] is None for r in res["finished"])
+    # the board row follows the branch, so a second merge still resolves it
+    assert _branch_of("proj-board", th.ids["step2"]) == "step-step2"
+    again = resolve.merge_result(world.team, th.ids["root"], apply=True)
+    assert {h["branch"] for h in again["heads"]} == {"step-design", "step-step2"}
+    assert {h["strategy"] for h in again["heads"]} == {"in-base"}
+    # the heads of the first run name the branch they were retired to
+    assert {h["renamed_to"] for h in res["heads"]} == {"step-design", "step-step2"}
+    assert res["renamed_to"] == "step-step2"
+
+
+def test_step_branch_name_reads_the_step_number_off_the_title(world,
+                                                              result_thread):
+    th = result_thread(world.workdir, "proj-board", "proj",
+                      titles={"step2": "Step 2: add Redis cache",
+                              "design": "Design the thing!"})
+    res = resolve.merge_result(world.team, th.ids["root"], apply=True)
+    renamed = {r["card"]: r["renamed_to"] for r in res["finished"]}
+    assert renamed[th.ids["step2"]] == "step-2-add-redis-cache"
+    assert renamed[th.ids["design"]] == "step-design-the-thing"
+
+
+def test_a_card_with_no_usable_title_falls_back_to_its_id(world, result_thread):
+    th = result_thread(world.workdir, "proj-board", "proj",
+                       titles={"step2": "***"})
+    res = resolve.merge_result(world.team, th.ids["root"], apply=True)
+    renamed = {r["card"]: r["renamed_to"] for r in res["finished"]}
+    assert renamed[th.ids["step2"]] == f"step-{th.ids['step2']}"
+
+
+def test_a_taken_name_gets_the_card_id_appended(world, result_thread):
+    th = result_thread(world.workdir, "proj-board", "proj")
+    th.git("branch", "step-step2", th.start)               # an operator got there first
+    res = resolve.merge_result(world.team, th.ids["root"], apply=True)
+    rows = {r["branch"]: r for r in res["finished"]}
+    assert rows["wt/step2"]["renamed_to"] == f"step-step2-{th.ids['step2']}"
+    assert "step-step2" in _branches(world.workdir)        # left alone
+
+
+def test_a_dirty_worktree_is_kept_and_the_merge_still_stands(world,
+                                                             result_thread):
+    th = result_thread(world.workdir, "proj-board", "proj",
+                       worktrees=("step2",))
+    tree = world.workdir / ".worktrees" / th.ids["step2"]
+    (tree / "step2.py").write_text("unsaved work\n", encoding="utf-8")
+    res = resolve.merge_result(world.team, th.ids["root"], apply=True)
+    assert res["merged"] is True                           # the merge is untouched
+    row = next(r for r in res["finished"] if r["branch"] == "wt/step2")
+    assert row["removed"] is False and row["renamed_to"] is None
+    assert row["note"] and "wt/step2" in _branches(world.workdir)
+    assert _worktree_paths(world.workdir) == [str(tree)]
+    assert (tree / "step2.py").read_text() == "unsaved work\n"
+
+
+def test_nothing_is_retired_while_a_card_is_unfinished(world, result_thread):
+    th = result_thread(world.workdir, "proj-board", "proj",
+                       running=("step2",), worktrees=("design", "step1"))
+    res = resolve.merge_result(world.team, th.ids["root"], apply=True)
+    assert res["merged"] is True
+    assert [r["note"] for r in res["finished"]] == \
+        ["thread still has 1 unfinished card"] * 3
+    assert "wt/design" in _branches(world.workdir)
+    assert len(_worktree_paths(world.workdir)) == 2
+
+
+def test_an_unmerged_head_keeps_its_branch_and_worktree(world, result_thread):
+    th = result_thread(world.workdir, "proj-board", "proj",
+                       worktrees=("design", "step2"))
+    (world.workdir / "step2.py").write_text("operator\n", encoding="utf-8")
+    th.git("add", "-A")
+    th.git("commit", "-q", "-m", "operator wrote step2 first")
+    res = resolve.merge_result(world.team, th.ids["root"], apply=True)
+    rows = {r["branch"]: r for r in res["finished"]}
+    assert rows["wt/design"]["renamed_to"] == "step-design"
+    assert rows["wt/step2"]["note"] == "branch is not merged yet"
+    assert rows["wt/step2"]["renamed_to"] is None
+    assert "wt/step2" in _branches(world.workdir)
+    assert _worktree_paths(world.workdir) == \
+        [str(world.workdir / ".worktrees" / th.ids["step2"])]
+
+
+def test_a_merge_preview_only_reports_the_names_it_would_take(world,
+                                                              result_thread):
+    th = result_thread(world.workdir, "proj-board", "proj",
+                       worktrees=("design", "step2"))
+    before = _branches(world.workdir)
+    res = resolve.merge_result(world.team, th.ids["root"])
+    assert {r["branch"]: r["renamed_to"] for r in res["finished"]} == {
+        "wt/root": "step-root", "wt/design": "step-design",
+        "wt/step1": "step-step1", "wt/step2": "step-step2"}
+    assert all(r["removed"] is False for r in res["finished"])
+    assert _branches(world.workdir) == before
+    assert len(_worktree_paths(world.workdir)) == 2
+    assert _branch_of("proj-board", th.ids["step2"]) == "wt/step2"
+
+
 # ── thread_report: what happened on a finished thread ───────────────────────
 
 def _report_thread(board, tenant):

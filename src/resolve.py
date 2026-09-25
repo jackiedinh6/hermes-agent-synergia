@@ -38,7 +38,9 @@ table; each is also commented at its use site:
   ``model.TERMINAL_CWD_SENTINELS`` value to ``None`` ("unset"), never echoes
   the literal, and nothing here writes one.
 * Compat window .............. the only imports are ``hermes_cli.kanban_db``,
-  ``hermes_cli.kanban_db_connect``, ``hermes_cli.projects_db``,
+  ``hermes_cli.kanban_db_connect``, ``hermes_cli.kanban_db_workspace``
+  (``set_branch_name``'s modern home; the ``kanban_db`` re-export warns),
+  ``hermes_cli.projects_db``,
   ``hermes_cli.profiles``, ``hermes_cli.config``, ``hermes_constants``,
   ``utils`` (modern paths; no re-export shims, no name imported through
   ``profiles``/``profile_distribution``'s PLUGIN-COMPAT blocks). A
@@ -83,6 +85,13 @@ def _kb():
 def _kanban_conn():
     from hermes_cli import kanban_db_connect
     return kanban_db_connect
+
+
+def _kanban_workspace():
+    # The modern home of set_branch_name; the kanban_db re-export is a compat
+    # shim that warns (and pytest.ini turns that warning into an error).
+    from hermes_cli import kanban_db_workspace
+    return kanban_db_workspace
 
 
 def _profiles():
@@ -1186,7 +1195,14 @@ def merge_result(team: "model.Team", card_id: str, *, apply: bool = False) -> di
 
     ``heads`` carries every head and how it landed (``ff``, ``merge`` or
     ``in-base``); the flat ``card``/``title``/``branch``/``to`` keys name the
-    last head that landed, or the newest head when nothing needed to."""
+    last head that landed, or the newest head when nothing needed to.
+
+    An applied run then retires every card the new HEAD holds
+    (:func:`finish_worktrees`): its worktree is removed and its ``wt/<id>``
+    branch renamed to a readable ``step-<n>-<slug>``, reported in
+    ``finished``. A conflict-stopped run retires what landed and leaves the
+    heads in ``others`` on their ``wt/`` branch, in their worktree, for the
+    human merge."""
     import subprocess
     root_id, tasks = thread_of(team, card_id)
     workdir = os.path.realpath(os.path.expanduser(team.workdir or ""))
@@ -1194,7 +1210,7 @@ def merge_result(team: "model.Team", card_id: str, *, apply: bool = False) -> di
            "card": None, "title": None,
            "branch": None, "base": None, "from": None, "to": None, "ahead": 0,
            "commits": [], "others": [], "heads": [], "blocker": None,
-           "merged": False, "dry_run": not apply}
+           "finished": [], "merged": False, "dry_run": not apply}
     if not workdir_has_commit(workdir):
         raise TeamError(
             E_TEAM_INVALID,
@@ -1214,15 +1230,7 @@ def merge_result(team: "model.Team", card_id: str, *, apply: bool = False) -> di
         start = git("rev-parse", "HEAD").stdout.strip()
         out["base"], out["from"] = base, start
 
-        done = []
-        for t in tasks:
-            if t.status != "done" or t.workspace_kind != "worktree" \
-                    or not t.branch_name:
-                continue
-            r = git("rev-parse", "--verify", "--quiet",
-                    f"refs/heads/{t.branch_name}^{{commit}}", check=False)
-            if r.returncode == 0:
-                done.append((t, r.stdout.strip()))
+        done = _done_worktree_cards(tasks, git)
         if not done:
             return out
 
@@ -1273,6 +1281,8 @@ def merge_result(team: "model.Team", card_id: str, *, apply: bool = False) -> di
             seen.append(sha)
             pending.append(r)
         if not pending:
+            out["finished"] = finish_worktrees(
+                team, tasks, apply=apply, require_in=start if apply else None)
             return out
 
         dirty = git("diff", "--quiet", "HEAD", check=False).returncode != 0
@@ -1295,6 +1305,8 @@ def merge_result(team: "model.Team", card_id: str, *, apply: bool = False) -> di
             out["ahead"] = sum(r["ahead"] for r in pending)
             out["commits"] = log_of(*[r["sha"] for r in pending],
                                     "--not", start)
+            out["finished"] = finish_worktrees(team, tasks)
+            _name_heads(out)
             return out
 
         if dirty:
@@ -1335,6 +1347,9 @@ def merge_result(team: "model.Team", card_id: str, *, apply: bool = False) -> di
         out["ahead"] = int(git("rev-list", "--count",
                               f"{start}..{out['to']}").stdout)
         out["commits"] = log_of(f"{start}..{out['to']}")
+        out["finished"] = finish_worktrees(team, tasks, apply=True,
+                                           require_in=out["to"])
+        _name_heads(out)
         return out
     except (OSError, subprocess.SubprocessError) as exc:
         raise TeamError(
@@ -1343,6 +1358,202 @@ def merge_result(team: "model.Team", card_id: str, *, apply: bool = False) -> di
                  "merge into.",
             remedy=f"hermes team merge {team.slug} {card_id} --apply") from exc
 
+
+# ── retiring a finished worktree: step-named branch, worktree gone ──────────
+
+# Room for `step-<n>-` plus a slug (`model.slugify` caps at 64) plus the
+# `-<card id>` a collision appends.
+_STEP_BRANCH_MAX = 80
+
+
+def _done_worktree_cards(tasks, git) -> list:
+    """``[(task, sha)]`` for every done worktree card of *tasks* whose branch
+    still resolves in the workdir — the substrate deletes a ``wt/<id>`` branch
+    with the worktree it cleaned up, so a missing branch is not an error."""
+    out = []
+    for t in tasks:
+        if t.status != "done" or t.workspace_kind != "worktree" \
+                or not t.branch_name:
+            continue
+        r = git("rev-parse", "--verify", "--quiet",
+                f"refs/heads/{t.branch_name}^{{commit}}", check=False)
+        if r.returncode == 0:
+            out.append((t, r.stdout.strip()))
+    return out
+
+
+def step_branch_name(task) -> str:
+    """The readable branch a finished card's ``wt/<id>`` becomes:
+    ``step-<n>-<title slug>``, the step number from the card title
+    (:data:`_STEP_RE`, the same one :func:`thread_report` reads) and the slug
+    from what is left of it (:func:`model.slugify`).
+
+    A title with no step number gives ``step-<slug>``; a title no slug can be
+    made of gives ``step-<card id>``."""
+    title = str(task.title or "")
+    m = _STEP_RE.search(title)
+    prefix = f"step-{m.group(1)}" if m else "step"
+    rest = f"{title[:m.start()]} {title[m.end():]}" if m else title
+    try:
+        slug = model.slugify(rest)
+    except TeamError:
+        slug = str(task.id)
+    return f"{prefix}-{slug}"[:_STEP_BRANCH_MAX].rstrip("-_")
+
+
+def _free_branch_name(git, task) -> Optional[str]:
+    """:func:`step_branch_name` for *task*, or that name plus the card id when
+    another branch already holds it. None when both are taken — a name in use
+    is never stolen."""
+    want = step_branch_name(task)
+    for cand in (want, f"{want}-{task.id}"[:_STEP_BRANCH_MAX].rstrip("-_")):
+        if cand == task.branch_name:
+            return cand
+        if git("show-ref", "--verify", "--quiet", f"refs/heads/{cand}",
+               check=False).returncode != 0:
+            return cand
+    return None
+
+
+def _linked_worktrees(git, workdir: str) -> dict:
+    """``{branch: path}`` for every LINKED worktree of *workdir* — git's own
+    view, not the board's ``workspace_path``. The main checkout is left out:
+    it is never removed."""
+    out: dict = {}
+    path = None
+    for line in git("worktree", "list", "--porcelain",
+                    check=False).stdout.splitlines():
+        if line.startswith("worktree "):
+            path = line[len("worktree "):].strip()
+        elif line.startswith("branch ") and path:
+            branch = line[len("branch "):].strip()
+            if branch.startswith("refs/heads/") \
+                    and os.path.realpath(path) != workdir:
+                out[branch[len("refs/heads/"):]] = path
+        elif not line.strip():
+            path = None
+    return out
+
+
+def _record_branch_names(board: str, renamed: dict) -> None:
+    """Point each card's board row at the branch it was renamed to, so a later
+    :func:`merge_result` still resolves the thread's branches."""
+    db_path = _board_db(board)
+    if db_path is None:
+        return
+    try:
+        workspace = _kanban_workspace()
+        with _kanban_conn().connect_closing(db_path=db_path) as conn:
+            for card_id, branch in renamed.items():
+                workspace.set_branch_name(conn, card_id, branch)
+    except Exception:  # noqa: BLE001 — the branch is renamed either way
+        _LOG.warning("hermes-agent-synergia: could not record renamed branches "
+                     "on board %s: %s", board, ", ".join(sorted(renamed)))
+
+
+def finish_worktrees(team: "model.Team", tasks, *, apply: bool = False,
+                     require_in: Optional[str] = None) -> list:
+    """Retire the finished worktrees of a thread: remove each done card's
+    linked worktree and rename its ``wt/<id>`` branch to
+    :func:`step_branch_name`, so the work stays on a branch that says which
+    step it was and the dispatcher's checkout stops piling up under
+    ``<workdir>/.worktrees/``.
+
+    Nothing else does this. The substrate only removes a worktree whose
+    commits are reachable from a REMOTE-tracking ref
+    (``kanban_db_workspace._cleanup_worktree_workspace``), which a local team
+    workdir has none of, so every finished worktree is preserved forever.
+
+    One row per done worktree card: ``card``, ``title``, ``branch`` (the name
+    it had), ``renamed_to``, ``worktree``, ``removed`` and ``note`` — why
+    nothing happened. ``apply=False`` only reports the names it would take.
+    *require_in* is a commit every card's branch must be an ancestor of (the
+    merged HEAD): unlanded work keeps its worktree and its ``wt/`` name.
+
+    Nothing is retired while a card of the thread is unfinished — a running
+    card may still read a sibling's handoff artifacts out of its worktree.
+    Called after the merge landed, so it never raises: a failure is a
+    ``note``, never a lost merge."""
+    import subprocess
+    workdir = os.path.realpath(os.path.expanduser(team.workdir or ""))
+    rows: list = []
+    try:
+        git = _git_in(workdir)
+        cards = _done_worktree_cards(tasks, git)
+        if not cards:
+            return rows
+        trees = _linked_worktrees(git, workdir)
+        unfinished = sum(1 for t in tasks if t.status != "done")
+        for task, sha in cards:
+            row = {"card": task.id, "title": task.title,
+                   "branch": task.branch_name, "renamed_to": None,
+                   "worktree": trees.get(task.branch_name), "removed": False,
+                   "note": None}
+            rows.append(row)
+            if unfinished:
+                row["note"] = (f"thread still has {unfinished} unfinished "
+                               f"card{'' if unfinished == 1 else 's'}")
+                continue
+            if require_in and sha != require_in \
+                    and git("merge-base", "--is-ancestor", sha, require_in,
+                            check=False).returncode != 0:
+                row["note"] = "branch is not merged yet"
+                continue
+            free = _free_branch_name(git, task)
+            if free is None:
+                row["note"] = (f"{step_branch_name(task)} is taken by another "
+                               "branch")
+                continue
+            if free != task.branch_name:
+                row["renamed_to"] = free
+        if not apply:
+            return rows
+
+        renamed: dict = {}
+        for row in rows:
+            if row["note"]:
+                continue
+            if row["worktree"]:
+                # No --force: git's own dirty guard preserves a worktree that
+                # still holds uncommitted work, and a branch checked out in a
+                # live worktree cannot be renamed either.
+                r = git("worktree", "remove", row["worktree"], check=False,
+                        timeout=120)
+                row["removed"] = r.returncode == 0
+                if not row["removed"]:
+                    row["note"] = ((r.stderr or r.stdout).strip()[-200:]
+                                   or "git worktree remove failed")
+                    row["renamed_to"] = None
+                    continue
+            if row["renamed_to"]:
+                r = git("branch", "-m", row["branch"], row["renamed_to"],
+                        check=False)
+                if r.returncode:
+                    row["note"] = ((r.stderr or r.stdout).strip()[-200:]
+                                   or "git branch -m failed")
+                    row["renamed_to"] = None
+                    continue
+                renamed[row["card"]] = row["renamed_to"]
+        git("worktree", "prune", check=False)
+        if renamed:
+            _record_branch_names(team.board, renamed)
+        return rows
+    except (OSError, subprocess.SubprocessError) as exc:
+        for row in rows:
+            row["note"] = row["note"] or str(exc)[-200:]
+        _LOG.warning("hermes-agent-synergia: could not retire the worktrees of "
+                     "team %s: %s", team.slug, exc)
+        return rows
+
+
+def _name_heads(out: dict) -> None:
+    """Copy each retired card's new branch onto its ``heads`` row (and the flat
+    ``renamed_to``), so a caller can name a head by the branch that is left."""
+    renamed = {r["card"]: r["renamed_to"] for r in out["finished"]
+               if r["renamed_to"]}
+    for h in out["heads"]:
+        h["renamed_to"] = renamed.get(h["card"])
+    out["renamed_to"] = renamed.get(out["card"])
 
 # ── finished-thread report ──────────────────────────────────────────────────
 

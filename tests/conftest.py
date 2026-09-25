@@ -145,8 +145,11 @@ def result_thread(hermes_root):
     ``root`` (no commits of its own) has two children: ``design``, a sibling
     that diverges, and ``step1`` → ``step2``, a step chain, so ``wt/step2``
     contains ``wt/step1``. Cards complete in that order; names in ``running``
-    stay running. Returns ``SimpleNamespace(workdir, start, ids, git)`` with
-    ``ids`` mapping name → card id and ``git`` bound to the workdir.
+    stay running. Names in ``worktrees`` also get the linked worktree the
+    dispatcher leaves at ``<workdir>/.worktrees/<card id>``; by default the
+    branches stand alone (the state a substrate cleanup leaves). ``titles``
+    overrides a card's title. Returns ``SimpleNamespace(workdir, start, ids,
+    git)`` with ``ids`` mapping name → card id and ``git`` bound to the workdir.
     """
     import functools
     import types
@@ -157,7 +160,7 @@ def result_thread(hermes_root):
              ("step1", "master", "step1.py", ("root",)),
              ("step2", "wt/step1", "step2.py", ("step1",))]
 
-    def build(workdir, board, tenant, *, running=()):
+    def build(workdir, board, tenant, *, running=(), worktrees=(), titles=None):
         workdir = pathlib.Path(workdir)
         workdir.mkdir(parents=True, exist_ok=True)
         git = functools.partial(_git, workdir)
@@ -182,9 +185,13 @@ def result_thread(hermes_root):
                     git("commit", "-q", "-m", f"{name}: add {filename}")
                     git("checkout", "-q", "master")
                 tid = kanban_db.create_task(
-                    conn, title=name, tenant=tenant, workspace_kind="worktree",
+                    conn, title=(titles or {}).get(name, name), tenant=tenant,
+                    workspace_kind="worktree",
                     branch_name=branch, parents=[ids[p] for p in parents],
                     initial_status="running", board=board)
+                if name in worktrees:
+                    git("worktree", "add", "-q",
+                        str(workdir / ".worktrees" / tid), branch)
                 # created_at is whole seconds: pin it so `root` roots the thread.
                 done = name not in running
                 conn.execute(

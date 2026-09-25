@@ -504,12 +504,13 @@ def _setup_parser_impl(p):
 
     sp = subs.add_parser(
         "merge",
-        help="Fast-forward the team's workdir to the result branch of the "
-             "card's thread (preview unless --apply)")
+        help="Land the result branch of the card's thread on the team's "
+             "workdir, then retire each card's worktree onto a step-named "
+             "branch (preview unless --apply)")
     sp.add_argument("team")
     sp.add_argument("card", help="Any card of the thread, usually its root")
     sp.add_argument("--apply", action="store_true",
-                    help="Fast-forward now; without it, only preview")
+                    help="Merge and retire now; without it, only preview")
     sp.add_argument("--json", action="store_true")
 
     sp = subs.add_parser(
@@ -2369,6 +2370,15 @@ def _merge_lines(res: dict) -> list:
                      f"{res['root']} --apply")
     lines += [f"  not included: {o['branch']} — {o['card']}: {o['title']}"
               for o in res["others"]]
+    for f in res.get("finished") or []:
+        if f["note"]:
+            lines.append(f"  kept {f['branch']}: {f['note']}")
+        elif res["dry_run"] and f["renamed_to"]:
+            lines.append(f"  would finish {f['branch']} -> {f['renamed_to']}")
+        elif f["renamed_to"] or f["removed"]:
+            how = "worktree removed" if f["removed"] else "no worktree"
+            lines.append(f"  finished {f['branch']} -> "
+                         f"{f['renamed_to'] or f['branch']} ({how})")
     lines.append(f"  files: {res['workdir']}")
     return lines
 

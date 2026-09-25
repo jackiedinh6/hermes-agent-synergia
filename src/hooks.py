@@ -352,7 +352,9 @@ def on_task_completed(**kw: Any) -> None:
     """When the last card of a worktree team's thread finishes, fast-forward
     the workdir to the thread's result branch — the substrate never merges a
     ``wt/<id>`` branch, so otherwise the work lives only under ``.worktrees/``
-    and the next thread branches off a HEAD that never saw it.
+    and the next thread branches off a HEAD that never saw it. Each merged
+    card's worktree is then removed and its branch renamed to a step-named
+    one (``resolve.finish_worktrees``).
 
     Fires in the worker AFTER the board's DB commit, so the finished row reads
     back as ``done``. The whole decision is :func:`approvals.on_completed`;

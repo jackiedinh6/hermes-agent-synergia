@@ -708,6 +708,14 @@ def _run_checks_inner(results: list, root: Path) -> None:
     check(results, "kanban_task_completed ∈ VALID_HOOKS",
           lambda: _hook("kanban_task_completed"))
 
+    # 52. Retiring a merged worktree renames wt/<id> to a step branch, so the
+    #     card's board row must follow it — on the MODERN path: the kanban_db
+    #     re-export of set_branch_name is a compat shim that warns.
+    def c_set_branch_name():
+        from hermes_cli import kanban_db_workspace as kbw
+        return _callable_attr(kbw, "set_branch_name")
+    check(results, "kanban_db_workspace.set_branch_name", c_set_branch_name)
+
     # ---- notices: printed, never asserted (Do.8, Do.13) ----
 
     # Compat-window operator notice (Do.8).

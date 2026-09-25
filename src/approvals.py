@@ -1342,17 +1342,37 @@ def auto_merge_enabled() -> bool:
     return bool(value)
 
 
+def _head_branch(head: dict) -> str:
+    """How a landed head is named once it is retired: the step branch it was
+    renamed to, with the ``wt/`` name it merged under in parentheses."""
+    if head.get("renamed_to"):
+        return f"`{head['renamed_to']}` (was `{head['branch']}`)"
+    return f"`{head['branch']}`"
+
+
 def merge_comment(res: dict) -> str:
     """The root-card line for a :func:`resolve.merge_result` that merged at
-    least one head."""
+    least one head, naming each head by the branch it was retired to
+    (:func:`resolve.finish_worktrees`)."""
     n = res["ahead"]
-    body = (f"Merged `{res['branch']}` into `{res['base']}` "
+    branch = (f"`{res['renamed_to']}` (was `{res['branch']}`)"
+              if res.get("renamed_to") else f"`{res['branch']}`")
+    body = (f"Merged {branch} into `{res['base']}` "
             f"(`{res['to'][:12]}`, {n} commit{'' if n == 1 else 's'}). "
             f"Files: `{res['workdir']}`.")
     landed = [h for h in (res.get("heads") or []) if h["merged"]]
     if len(landed) > 1:
         body += " Heads: " + ", ".join(
-            f"`{h['branch']}` ({h['card']})" for h in landed) + "."
+            f"{_head_branch(h)} ({h['card']})" for h in landed) + "."
+    finished = res.get("finished") or []
+    removed = [f for f in finished if f["removed"]]
+    if removed:
+        body += (f" Worktree{'' if len(removed) == 1 else 's'} removed: "
+                 f"{len(removed)}.")
+    kept = [f for f in finished if f["note"]]
+    if kept:
+        body += " Kept: " + ", ".join(
+            f"`{f['branch']}` ({f['note']})" for f in kept) + "."
     if res["others"]:
         body += " Not included: " + ", ".join(
             f"`{o['branch']}` ({o['card']})" for o in res["others"]) + "."
