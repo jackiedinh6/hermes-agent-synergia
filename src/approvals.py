@@ -72,7 +72,7 @@ from .errors import (
     E_TEAM_NOT_FOUND,
     E_TEAM_NO_BOARD,
 )
-from . import storage
+from . import model, storage
 
 BLOCKED_STATUS = "blocked"
 REVIEW_STATUS = "review"
@@ -292,6 +292,7 @@ def _row(t, conn, task, *, now: int, facts=None) -> dict:
                    for a in kanban_db.list_attachments(conn, task.id)]
     row = {
         "id": task.id,
+        "step_label": model.step_label(task.title, task.id),
         "team": t.slug,
         "board": t.board,
         "assignee": task.assignee,
@@ -990,6 +991,7 @@ def _decide(t, task_id: str, *, body: str, text: str, author, action: str,
         "team": t.slug,
         "board": t.board,
         "task_id": task_id,
+        "step_label": model.step_label(task.title, task_id),
         "action": action,
         "lane": lane,
         "author": author,

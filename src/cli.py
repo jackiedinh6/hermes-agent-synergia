@@ -2344,7 +2344,7 @@ def _merge_lines(res: dict) -> list:
                 "branch to merge"]
     n = res["ahead"]
     lines = [f"result of thread {res['root']} ({res['team']}): {res['branch']} "
-             f"— {res['card']}: {res['title']}"]
+             f"— {res['step_label']} ({res['card']}): {res['title']}"]
     if res["merged"]:
         lines.append(f"  merged {n} commit(s) into {res['base']}: "
                      f"{res['from'][:12]}..{res['to'][:12]}")
@@ -2360,7 +2360,8 @@ def _merge_lines(res: dict) -> list:
         state = "merged" if h["merged"] else \
             ("blocked" if h["blocker"] else
              ("" if h["strategy"] == "in-base" else "pending"))
-        lines.append(f"  head {h['branch']} — {h['card']}: {h['title']} "
+        lines.append(f"  head {h['branch']} — {h['step_label']} "
+                     f"({h['card']}): {h['title']} "
                      f"({how}{', ' + state if state else ''})")
     if res["blocker"]:
         lines.append(f"  blocked: {res['blocker']['message']}")
@@ -2368,8 +2369,8 @@ def _merge_lines(res: dict) -> list:
     elif not res["merged"] and n:
         lines.append(f"  apply with: hermes team merge {res['team']} "
                      f"{res['root']} --apply")
-    lines += [f"  not included: {o['branch']} — {o['card']}: {o['title']}"
-              for o in res["others"]]
+    lines += [f"  not included: {o['branch']} — {o['step_label']} "
+              f"({o['card']}): {o['title']}" for o in res["others"]]
     for f in res.get("finished") or []:
         if f["note"]:
             lines.append(f"  kept {f['branch']}: {f['note']}")
@@ -3083,7 +3084,10 @@ def _cmd_status(args) -> int:
     awaiting_ids = {r.id for r in awaiting}
     for r in shown:
         mark = " *" if r.id in awaiting_ids else "  "
-        human.append(f"  {mark}{r.id:<8} {r.status:<8} "
+        # The label is what the card is called; the id is what commands take,
+        # so the fixed-width list carries both (label truncated, id never).
+        human.append(f"  {mark}{model.step_label(r.title, r.id):<32.32} "
+                     f"{r.id:<10} {r.status:<8} "
                      f"{(r.assignee or '-'):<16} {_age_h(r.created_at, now):>4}  "
                      f"{r.title}")
     if awaiting_ids & {r.id for r in shown}:
@@ -3249,7 +3253,8 @@ def _approval_lines(rows: list, now: int, *, with_team: bool) -> list:
         age = _age_h((now - r["age_seconds"]) if r["age_seconds"] is not None else None, now)
         who = f"{r['team']:<12} " if with_team else ""
         mark = _LANE_MARK.get(r.get("reason_kind"), "")
-        lines.append(f"  {r['id']:<12} {who}{(r['assignee'] or '-'):<24} "
+        lines.append(f"  {r['step_label']:<32.32} {r['id']:<10} "
+                     f"{who}{(r['assignee'] or '-'):<24} "
                      f"{age:>4}  {mark}{r['title']}")
         lines.extend(_lane_why(r))
         if r.get("attachments"):
@@ -3288,7 +3293,8 @@ def _summary_lines(summary) -> list:
 
 
 def _detail_lines(t, d: dict) -> list:
-    lines = [f"{d['id']}  team={t.slug}  board={t.board}  "
+    lines = [f"{d['step_label']}  ({d['id']})  team={t.slug}  "
+             f"board={t.board}  "
              f"status={d['status']}/{d.get('block_kind') or '-'}",
              f"  {d['title']}",
              f"  assignee: {d.get('assignee') or '-'}"]
@@ -3454,7 +3460,8 @@ def _transition_line(res: dict) -> str:
 
 def _decision_lines(res: dict) -> list:
     verb = _DECISION_VERBS.get(res["action"], res["action"])
-    lines = [f"{verb} {res['task_id']} ({res['team']}): {res['title']}",
+    lines = [f"{verb} {res['step_label']} ({res['task_id']}) "
+             f"({res['team']}): {res['title']}",
              f"  comment #{res['comment_id']} by {res['author']}"]
     if res["action"] == "note":
         lines.append(_NOTE_DELIVERY.get(res.get("delivery"),

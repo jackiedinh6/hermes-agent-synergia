@@ -49,7 +49,7 @@ from .errors import (
     E_TEAM_NOT_MEMBER,
     E_TEAM_NO_BOARD,
 )
-from .model import _normalize_profile_name, board_label
+from .model import _normalize_profile_name, board_label, step_label
 from .policy import WORKSPACE_KIND
 
 log = logging.getLogger("hermes_plugins.hermes_agent_synergia.tools")
@@ -318,6 +318,8 @@ _STATUS_MAX_LIMIT = 100
 
 def _task_view(task) -> dict:
     return {"id": task.id, "title": task.title, "status": task.status,
+            # The name the card is shown and branched under, everywhere.
+            "step_label": step_label(task.title, task.id),
             "assignee": task.assignee, "priority": task.priority,
             "created_at": task.created_at,
             # A blocked card reads the same as any other without this —

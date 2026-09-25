@@ -1448,6 +1448,21 @@ def test_get_approvals_is_registry_wide(client, waiting):
     assert [a["filename"] for a in row["attachments"]] == ["design.md"]
 
 
+def test_every_card_row_carries_its_step_label(client, waiting):
+    """The board, the inbox and one card in full agree on the card's name."""
+    label = "step-needs-a-decision"
+    st = client.get(f"{P}/teams/px/status").json()["data"]
+    assert [t["step_label"] for t in st["tasks"]] == [label]
+    rows = client.get(f"{P}/teams/px/approvals").json()["data"]["approvals"]
+    assert [r["step_label"] for r in rows] == [label]
+    d = client.get(
+        f"{P}/teams/px/tasks/{waiting['task_id']}/approval").json()["data"]
+    assert d["step_label"] == label
+    thread = client.get(
+        f"{P}/teams/px/tasks/{waiting['task_id']}").json()["data"]
+    assert [t["step_label"] for t in thread["tasks"]] == [label]
+
+
 def test_get_team_approvals_and_detail(client, waiting):
     data = client.get(f"{P}/teams/px/approvals").json()["data"]
     assert [r["id"] for r in data["approvals"]] == [waiting["task_id"]]
@@ -1998,6 +2013,9 @@ def test_thread_report_reads_the_whole_thread(client, world, result_thread):
     d = r.json()["data"]
     assert d["root"] == th.ids["root"] and d["finished"] is True
     assert [c["id"] for c in d["cards"]][0] == th.ids["root"]
+    # every card names itself the way its branch is named
+    assert [c["step_label"] for c in d["cards"]] == [
+        "step-root", "step-design", "step-step1", "step-step2"]
     assert d["totals"]["cards"] == 4 and d["totals"]["tokens_in"] is None
     assert client.get(f"{P}/teams/rp/tasks/t_nope/report").status_code == 404
     assert client.get(f"{P}/teams/nope/tasks/{th.ids['root']}/report").status_code == 404

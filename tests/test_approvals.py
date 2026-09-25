@@ -162,6 +162,8 @@ def test_row_carries_what_the_operator_needs(alpha):
     assert [a["filename"] for a in row["attachments"]] == ["design.md"]
     assert row["attachments"][0]["previewable"] is True
     assert row["age_seconds"] >= 0
+    # the card's one name: what every surface prints and its branch is renamed to
+    assert row["step_label"] == "step-design-the-tracker"
 
 
 def test_pending_all_spans_teams(alpha):

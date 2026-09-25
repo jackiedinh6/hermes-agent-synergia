@@ -772,6 +772,7 @@ def _task_view(task) -> dict:
     """The activity panel's row shape (§10 status). Body is omitted —
     the panel polls; large bodies belong in the task detail view."""
     return {"id": task.id, "title": task.title, "status": task.status,
+            "step_label": _mod("model").step_label(task.title, task.id),
             "assignee": task.assignee, "priority": task.priority,
             "tenant": task.tenant, "workspace_kind": task.workspace_kind,
             "workspace_path": task.workspace_path,

@@ -17,6 +17,7 @@ import pytest
 
 import resolve
 from errors import TeamError
+import model
 from model import Member, Project, Team
 
 # §4.3's _resolved keys, verbatim and in order.
@@ -332,6 +333,32 @@ def test_merge_retires_every_done_card_and_its_worktree(world, result_thread):
     # the heads of the first run name the branch they were retired to
     assert {h["renamed_to"] for h in res["heads"]} == {"step-design", "step-step2"}
     assert res["renamed_to"] == "step-step2"
+
+
+def test_step_label_is_the_name_a_card_is_shown_and_branched_under():
+    assert model.step_label("Step 3: wire the reducer", "t_1") == \
+        "step-3-wire-the-reducer"
+    assert model.step_label("step 12 — retry the dispatcher", "t_1") == \
+        "step-12-retry-the-dispatcher"
+    # no step number: the slug stands alone
+    assert model.step_label("Fix the flaky login test", "t_1") == \
+        "step-fix-the-flaky-login-test"
+    # nothing slug-shaped is left: the card id is the name
+    assert model.step_label("***", "t_abc123") == "step-t_abc123"
+    assert model.step_label("", "t_abc123") == "step-t_abc123"
+    # slugify caps the slug at 64, so a long title stops well inside
+    # STEP_LABEL_MAX — the rest of that budget is for the card id a branch
+    # collision appends — and never ends on a separator
+    long = model.step_label("Step 4: " + "a" * 200, "t_1")
+    assert long == "step-4-" + "a" * 64
+    assert len(long) <= model.STEP_LABEL_MAX
+
+
+def test_step_number_reads_the_title_and_nothing_else():
+    assert model.step_number("Step 3: wire the reducer") == 3
+    assert model.step_number("STEP 12 of many") == 12
+    assert model.step_number("stepping on stones") is None
+    assert model.step_number(None) is None
 
 
 def test_step_branch_name_reads_the_step_number_off_the_title(world,

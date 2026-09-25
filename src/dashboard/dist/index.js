@@ -1579,6 +1579,18 @@
     };
   }
 
+  // A card is named by its step label — the same string its branch is renamed
+  // to when the card is retired. The raw id rides along because every command
+  // and route still takes the id, never the label.
+  function stepName(card) {
+    const label = card && card.step_label;
+    const id = String((card && card.id) || "");
+    return h("span", { className: "ht-row", title: (label ? label + " · " : "") + id },
+      h("code", { className: "ht-code" }, label || id.slice(0, 8)),
+      label ? h("code", { className: "ht-step-id" }, id) : null
+    );
+  }
+
   // ═══════════════════════════════════════════════════════════════════════════
   // Chat — the product surface. One team, one thread, these routes:
   //   GET  /teams/{slug}/status                     lanes + started tasks
@@ -2422,7 +2434,7 @@
             function () { props.onOpen(rootId); }, "Open this card's thread");
           row.className = cn(row.className, "ht-board-card");
           return h("div", row,
-            h("code", { className: "ht-code" }, String(task.id).slice(0, 8)),
+            stepName(task),
             h("div", { className: "ht-board-title" }, task.title || ""),
             h("div", { className: "ht-row ht-row-wrap" },
               h(AssigneeChip, { assignee: task.assignee }),
@@ -2702,7 +2714,6 @@
     if (!r || r.root !== props.rootId || !(r.cards || []).length) return null;
 
     const t = r.totals || {};
-    const code = function (text) { return h("code", { className: "ht-code" }, text); };
     const wall = r.started_at && r.ended_at ? fmtMinutes(r.ended_at - r.started_at) : null;
     const lead = "The thread finished" + (wall ? " in " + wall : "") + ": " +
       t.cards + (t.cards === 1 ? " card, " : " cards, ") +
@@ -2726,7 +2737,7 @@
               r.cards.map(function (c) {
                 const who = (c.implementer || []).map(function (p) { return shortProfile(p, props.slug); });
                 return h("tr", { key: c.id },
-                  h("td", { title: c.title }, c.step ? "step " + c.step : c.title, " ", code(c.id)),
+                  h("td", { title: c.title }, stepName(c)),
                   h("td", null, who.length ? who.join(", ") : h(Muted, null, "—")),
                   h("td", null, reviewOf(c, props.slug)),
                   h("td", null, runTimeOf(c),
@@ -3035,7 +3046,7 @@
       compact ? null : h("div", { className: "ht-panel-head" },
         h("div", null,
           h("div", { className: "ht-row" },
-            h("code", { className: "ht-code" }, task.id),
+            stepName(task),
             h(StatusChip, { status: task.status })),
           h("strong", { className: "ht-run-title" }, task.title || "")
         ),
@@ -3518,7 +3529,7 @@
     return h("div", { className: "ht-approval" },
       h("div", { className: "ht-approval-head" },
         h("div", { className: "ht-row" },
-          h("code", { className: "ht-code" }, row.id),
+          stepName(row),
           spec.mark ? h("span", { className: "ht-approval-stuck" }, spec.mark) : null,
           h("span", { className: "ht-approval-wait" },
             spec.wait + ageOf(row.blocked_at || row.created_at)),

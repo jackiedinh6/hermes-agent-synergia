@@ -218,6 +218,40 @@ def slugify(name: str) -> str:
     return slug
 
 
+# ── step labels: the one name a card is shown and branched under ────────────
+#
+# Room for ``step-<n>-`` plus a slug (``slugify`` caps at 64) plus the
+# ``-<card id>`` a branch collision appends.
+STEP_LABEL_MAX = 80
+STEP_RE = re.compile(r"\bstep (\d+)\b", re.IGNORECASE)
+
+
+def step_number(title) -> Optional[int]:
+    """The step number a card title names, or None."""
+    m = STEP_RE.search(str(title or ""))
+    return int(m.group(1)) if m else None
+
+
+def step_label(title, card_id) -> str:
+    """The readable name of the card *title* belongs to:
+    ``step-<n>-<title slug>``, the number from :data:`STEP_RE` and the slug
+    from what is left of the title (:func:`slugify`).
+
+    A title with no step number gives ``step-<slug>``; a title no slug can be
+    made of gives ``step-<card id>``. Every surface shows this string, and
+    ``resolve.step_branch_name`` branches a finished card under it, so the name
+    an operator reads is the name in ``git branch``."""
+    title = str(title or "")
+    m = STEP_RE.search(title)
+    prefix = f"step-{m.group(1)}" if m else "step"
+    rest = f"{title[:m.start()]} {title[m.end():]}" if m else title
+    try:
+        slug = slugify(rest)
+    except TeamError:
+        slug = str(card_id)
+    return f"{prefix}-{slug}"[:STEP_LABEL_MAX].rstrip("-_")
+
+
 def _name_key(value) -> str:
     try:
         return slugify(value)

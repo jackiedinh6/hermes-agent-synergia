@@ -245,6 +245,15 @@ def test_status_human_mode_writes_only_to_stderr(alpha, parser, capsys):
     assert "2h" in err                               # age column (t1, 7200s)
     assert "3d" in err                               # age column (t4)
     assert "t5" not in err                           # done is not an open card
+    # the card is named the way its branch is named, id kept for pasting
+    assert "step-card-t3" in err
+
+
+def test_status_rows_carry_the_step_label(alpha, parser, capsys):
+    code, env, err = _run(parser, "status", "alpha", "--json", capsys=capsys)
+    assert code == 0, err
+    labels = {c["id"]: c["step_label"] for c in env["data"]["open_cards"]}
+    assert labels["t3"] == "step-card-t3"            # seeded title: "card t3"
 
 
 # ── §12: the tenant-less team reads honestly EMPTY + names the remedy ────────
@@ -319,7 +328,8 @@ def test_status_human_names_the_verb_for_a_parked_lane(alpha, parser, capsys):
 
 def _merge_payload(**kw) -> dict:
     res = {"team": "alpha", "workdir": "/w", "root": "t_root",
-           "card": "t_2", "title": "step 2", "branch": "wt/t_2",
+           "card": "t_2", "title": "step 2", "step_label": "step-2",
+           "branch": "wt/t_2",
            "base": "master", "from": "a" * 40, "to": "b" * 40, "ahead": 2,
            "commits": [], "others": [], "heads": [], "blocker": None,
            "finished": [], "merged": True, "dry_run": False}
@@ -328,7 +338,8 @@ def _merge_payload(**kw) -> dict:
 
 
 def _finished(branch, **kw) -> dict:
-    row = {"card": "t_2", "title": "step 2", "branch": branch,
+    row = {"card": "t_2", "title": "step 2", "step_label": "step-2",
+           "branch": branch,
            "renamed_to": None, "worktree": None, "removed": False,
            "note": None}
     row.update(kw)

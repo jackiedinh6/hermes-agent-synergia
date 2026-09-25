@@ -683,6 +683,10 @@
   padding: .35rem .45rem;
 }
 .ht-board-title { font-size: .8rem; word-break: break-word; }
+.ht-step-id {
+  font-family: var(--font-mono, ui-monospace, monospace); font-size: .68rem;
+  color: var(--color-muted-foreground); word-break: break-all;
+}
 
 .ht-settings { display: flex; flex-direction: column; gap: .9rem; }
 .ht-settings-head {

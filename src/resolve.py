@@ -1194,8 +1194,9 @@ def merge_result(team: "model.Team", card_id: str, *, apply: bool = False) -> di
     main checkout are refused before anything is merged.
 
     ``heads`` carries every head and how it landed (``ff``, ``merge`` or
-    ``in-base``); the flat ``card``/``title``/``branch``/``to`` keys name the
-    last head that landed, or the newest head when nothing needed to.
+    ``in-base``); the flat ``card``/``title``/``step_label``/``branch``/``to``
+    keys name the last head that landed, or the newest head when nothing needed
+    to. Every card-shaped row carries the ``step_label`` it is shown under.
 
     An applied run then retires every card the new HEAD holds
     (:func:`finish_worktrees`): its worktree is removed and its ``wt/<id>``
@@ -1207,7 +1208,7 @@ def merge_result(team: "model.Team", card_id: str, *, apply: bool = False) -> di
     root_id, tasks = thread_of(team, card_id)
     workdir = os.path.realpath(os.path.expanduser(team.workdir or ""))
     out = {"team": team.slug, "workdir": workdir, "root": root_id,
-           "card": None, "title": None,
+           "card": None, "title": None, "step_label": None,
            "branch": None, "base": None, "from": None, "to": None, "ahead": 0,
            "commits": [], "others": [], "heads": [], "blocker": None,
            "finished": [], "merged": False, "dry_run": not apply}
@@ -1255,10 +1256,12 @@ def merge_result(team: "model.Team", card_id: str, *, apply: bool = False) -> di
         heads.sort(key=lambda h: (h[0].completed_at or 0, h[0].id))
         newest = heads[-1]
         out.update(card=newest[0].id, title=newest[0].title,
+                   step_label=model.step_label(newest[0].title, newest[0].id),
                    branch=newest[0].branch_name, to=newest[1])
 
         def row(task, sha, **kw) -> dict:
             r = {"card": task.id, "title": task.title,
+                 "step_label": model.step_label(task.title, task.id),
                  "branch": task.branch_name, "sha": sha, "ahead": 0,
                  "commits": [], "strategy": "in-base", "merged": False,
                  "blocker": None}
@@ -1331,11 +1334,13 @@ def merge_result(team: "model.Team", card_id: str, *, apply: bool = False) -> di
                     "remedy": f"git -C {workdir} merge {r['branch']}"}
                 out["blocker"] = r["blocker"]
                 out["others"] = [{"card": o["card"], "branch": o["branch"],
-                                  "title": o["title"]} for o in pending[n:]]
+                                  "title": o["title"],
+                                  "step_label": o["step_label"]}
+                                 for o in pending[n:]]
                 break
             r["merged"] = True
             out.update(merged=True, card=r["card"], title=r["title"],
-                       branch=r["branch"])
+                       step_label=r["step_label"], branch=r["branch"])
 
         if not out["merged"]:
             raise TeamError(E_TEAM_INVALID, out["blocker"]["message"],
@@ -1361,9 +1366,7 @@ def merge_result(team: "model.Team", card_id: str, *, apply: bool = False) -> di
 
 # ── retiring a finished worktree: step-named branch, worktree gone ──────────
 
-# Room for `step-<n>-` plus a slug (`model.slugify` caps at 64) plus the
-# `-<card id>` a collision appends.
-_STEP_BRANCH_MAX = 80
+_STEP_BRANCH_MAX = model.STEP_LABEL_MAX
 
 
 def _done_worktree_cards(tasks, git) -> list:
@@ -1383,22 +1386,14 @@ def _done_worktree_cards(tasks, git) -> list:
 
 
 def step_branch_name(task) -> str:
-    """The readable branch a finished card's ``wt/<id>`` becomes:
-    ``step-<n>-<title slug>``, the step number from the card title
-    (:data:`_STEP_RE`, the same one :func:`thread_report` reads) and the slug
-    from what is left of it (:func:`model.slugify`).
+    """The readable branch a finished card's ``wt/<id>`` becomes: the card's
+    step label (:func:`model.step_label`), the same string every surface shows
+    it under.
 
-    A title with no step number gives ``step-<slug>``; a title no slug can be
-    made of gives ``step-<card id>``."""
-    title = str(task.title or "")
-    m = _STEP_RE.search(title)
-    prefix = f"step-{m.group(1)}" if m else "step"
-    rest = f"{title[:m.start()]} {title[m.end():]}" if m else title
-    try:
-        slug = model.slugify(rest)
-    except TeamError:
-        slug = str(task.id)
-    return f"{prefix}-{slug}"[:_STEP_BRANCH_MAX].rstrip("-_")
+    The branch actually taken can still differ — :func:`_free_branch_name`
+    appends the card id when another branch already holds the label — so a
+    retired card reports its branch in ``renamed_to``, not here."""
+    return model.step_label(task.title, task.id)
 
 
 def _free_branch_name(git, task) -> Optional[str]:
@@ -1464,8 +1459,9 @@ def finish_worktrees(team: "model.Team", tasks, *, apply: bool = False,
     (``kanban_db_workspace._cleanup_worktree_workspace``), which a local team
     workdir has none of, so every finished worktree is preserved forever.
 
-    One row per done worktree card: ``card``, ``title``, ``branch`` (the name
-    it had), ``renamed_to``, ``worktree``, ``removed`` and ``note`` — why
+    One row per done worktree card: ``card``, ``title``, ``step_label``,
+    ``branch`` (the name it had), ``renamed_to``, ``worktree``, ``removed`` and
+    ``note`` — why
     nothing happened. ``apply=False`` only reports the names it would take.
     *require_in* is a commit every card's branch must be an ancestor of (the
     merged HEAD): unlanded work keeps its worktree and its ``wt/`` name.
@@ -1486,6 +1482,7 @@ def finish_worktrees(team: "model.Team", tasks, *, apply: bool = False,
         unfinished = sum(1 for t in tasks if t.status != "done")
         for task, sha in cards:
             row = {"card": task.id, "title": task.title,
+                   "step_label": model.step_label(task.title, task.id),
                    "branch": task.branch_name, "renamed_to": None,
                    "worktree": trees.get(task.branch_name), "removed": False,
                    "note": None}
@@ -1560,7 +1557,6 @@ def _name_heads(out: dict) -> None:
 # The dispatcher's prompt to every worker; a compression child session has
 # no prompt of its own and inherits its parent's card.
 _WORKER_PROMPT_RE = re.compile(r"\s*work kanban task (t_[0-9a-f]+)\b")
-_STEP_RE = re.compile(r"\bstep (\d+)\b", re.IGNORECASE)
 
 
 def _session_tokens(profile: str, task_ids, since: float) -> Optional[dict]:
@@ -1641,10 +1637,10 @@ def thread_report(team: "model.Team", card_id: str) -> dict:
             if r.ended_at is not None and end <= r.started_at:
                 continue
             (review if r.id in review_runs else work).append((r, end - r.started_at))
-        step = _STEP_RE.search(t.title or "")
         cards.append({
             "id": t.id, "title": t.title, "status": t.status,
-            "step": int(step.group(1)) if step else None,
+            "step": model.step_number(t.title),
+            "step_label": model.step_label(t.title, t.id),
             "implementer": list(dict.fromkeys(r.profile for r, _ in work if r.profile)),
             "reviewer": list(dict.fromkeys(r.profile for r, _ in review if r.profile)),
             "changes": sum(1 for r, _ in review if r.outcome == "changes_requested"),
