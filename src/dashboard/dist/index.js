@@ -1777,7 +1777,7 @@
               card ? h("span", { className: "ht-member-card" }, card.title || card.id) : null
             );
           }))
-        : h("p", { className: "ht-hint" }, "No members — add one in Settings.")
+        : h("p", { className: "ht-hint" }, "No members — add one from the team list.")
     );
   }
 
@@ -1839,7 +1839,7 @@
               }) : null
             );
           }))
-        : h("p", { className: "ht-hint" }, "No teams yet — create one in Settings.")
+        : h("p", { className: "ht-hint" }, "No teams yet — create one from the team list.")
     );
   }
 
@@ -2975,7 +2975,7 @@
       }) : null,
       // The decision lives where the work is read: the same ApprovalCard the
       // inbox draws, so the artifacts, the block reason and the verbs are all
-      // here instead of one screen away in Settings.
+      // here instead of one screen away on the team list.
       tab === "chat" && parked ? h(ApprovalCard, {
         slug: slug, row: parked, readOnly: props.readOnly,
         onReadOnly: props.onReadOnly,
@@ -5188,7 +5188,7 @@
     const rootRef = hooks.useRef(null);
     const toaster = useToast();
 
-    const [screen, setScreen] = hooks.useState("chat");
+    const [screen, setScreen] = hooks.useState("settings");
     const [teams, setTeams] = hooks.useState(null);
     const [selected, setSelected] = hooks.useState(rememberedTeam());
     const [revision, setRevision] = hooks.useState(null);
@@ -5282,18 +5282,16 @@
         h("div", null,
           h("div", { className: "ht-kicker" }, tx(t, "hero.kicker", "Managed agent teams")),
           h("h1", null, tx(t, "hero.title", "Synergia"))
-        ),
-        h("div", { className: "ht-row" },
-          h(PillBar, {
-            value: screen, onChange: setScreen,
-            items: [
-              { value: "chat", label: "Chat" },
-              { value: "settings", label: "Settings" },
-            ],
-          })
         )
       ),
       readOnly ? h(Note, { tone: "warn", title: "Read-only dashboard" }, READONLY_MESSAGE) : null,
+      // With no top-level switch, this is the only way out of a chat.
+      screen === "chat" ? h("div", { className: "ht-breadcrumb" },
+        h("button", {
+          type: "button", className: "ht-crumb",
+          onClick: function () { setScreen("settings"); },
+        }, "← all teams")
+      ) : null,
       screen === "chat" ? h("div", { className: "ht-chat" },
         // ChatScreen draws the rail itself once a team is open.
         teams && teams.length && selected ? null : h(TeamRail, {
@@ -5305,7 +5303,7 @@
           : null,
         teams && !teams.length
           ? h(Empty, { title: "No teams yet." },
-              "Settings → Teams → New team builds the roster, the board and the folder in one go.")
+              "New team on the team list builds the roster, the board and the folder in one go.")
           : null,
         teams && teams.length && selected ? h(ChatScreen, {
           key: selected, slug: selected, teams: teams, onSelect: selectTeam,
