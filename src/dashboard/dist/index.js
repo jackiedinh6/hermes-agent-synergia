@@ -4232,7 +4232,7 @@
             size: "sm", outlined: true, destructive: true, disabled: props.readOnly,
             onClick: function () { props.onDelete(row.slug); },
           }, "Delete"),
-          h(UI.Button, { size: "sm", outlined: true, onClick: function () { props.onOpen(row.slug); } },
+          h(UI.Button, { size: "sm", outlined: true, onClick: function () { props.onChat(row.slug); } },
             "Open")
         )
       )
@@ -4296,8 +4296,8 @@
       h("div", { className: "ht-team-grid" }, props.teams.map(function (row) {
         return h(TeamCard, {
           key: row.slug, row: row, detail: details[row.slug],
-          readOnly: props.readOnly, onOpen: props.onOpen, onDelete: destroy.request,
-          rootRef: props.rootRef,
+          readOnly: props.readOnly, onOpen: props.onOpen, onChat: props.onChat,
+          onDelete: destroy.request, rootRef: props.rootRef,
         });
       })),
       destroy.destroyer.isOpen ? h(DestroyTeamDialog, {
@@ -5159,7 +5159,7 @@
       ) : null,
       panel === "teams" && !slug ? h(TeamList, {
         teams: props.teams, refreshKey: props.refreshKey, rootRef: props.rootRef,
-        onOpen: setSlug, revision: props.revision, readOnly: props.readOnly,
+        onOpen: setSlug, onChat: props.onChat, revision: props.revision, readOnly: props.readOnly,
         onReadOnly: props.onReadOnly, onDestroyed: props.onDestroyed,
       }) : null,
       panel === "teams" && slug ? h(TeamDetail, {
@@ -5322,6 +5322,7 @@
         onDestroyed: onTeamDestroyed,
         onProfileCount: setProfileCount,
         onNewTeam: function () { setNewTeam(true); },
+        onChat: function (slug) { selectTeam(slug); setScreen("chat"); },
         onToast: function (message) { toaster.showToast(message, "success"); },
       }) : null,
       newTeam ? h(NewTeamDialog, {
