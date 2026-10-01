@@ -9,7 +9,9 @@ The catalog used to be only a read-only view over pack roots
   ``provision.instantiate`` installs from it unchanged;
 * ``catalog.yaml`` — the index: ``entries`` (pack, display_name, category,
   origin, added_at per id), ``hidden`` (ids kept out of the pickers,
-  external-root ids included) and ``recipes`` merged in by pack imports.
+  external-root ids included), ``recipes`` merged in by pack imports, and
+  ``seeded`` (bundled sample ids already offered once, see
+  :func:`seed_samples`).
 
 ``catalog.yaml`` is written only through ``storage.save_yaml_file`` (flock +
 CAS + ``.bak`` + atomic), mutating the base it re-reads under the lock.
@@ -50,6 +52,8 @@ from .errors import (
 
 INDEX_FILENAME = "catalog.yaml"
 LOCAL_PACK = "local"
+SAMPLES_PACK = "samples"
+SAMPLES_ROOT = Path(__file__).resolve().parent / "samples" / "profiles"
 GIT_CLONE_TIMEOUT_S = 300
 SOUL_PREVIEW_MAX = 64 * 1024
 
@@ -106,12 +110,14 @@ def _normalize(raw: dict) -> dict:
     entries = raw.get("entries") if isinstance(raw.get("entries"), dict) else {}
     hidden = raw.get("hidden") if isinstance(raw.get("hidden"), list) else []
     recipes = raw.get("recipes") if isinstance(raw.get("recipes"), list) else []
+    seeded = raw.get("seeded") if isinstance(raw.get("seeded"), list) else []
     return {
         "revision": int(raw.get("revision") or 0),
         "entries": {str(k): dict(v) if isinstance(v, dict) else {}
                     for k, v in entries.items()},
         "hidden": sorted({str(h) for h in hidden}),
         "recipes": [dict(r) for r in recipes if isinstance(r, dict) and r.get("id")],
+        "seeded": sorted({str(s) for s in seeded}),
     }
 
 
@@ -155,7 +161,8 @@ def _write_index(mutate: Callable[[dict], None], *,
         index = _normalize(base or {})
         mutate(index)
         return {"schema_version": 1, "entries": index["entries"],
-                "hidden": sorted(set(index["hidden"])), "recipes": index["recipes"]}
+                "hidden": sorted(set(index["hidden"])), "recipes": index["recipes"],
+                "seeded": sorted(set(index["seeded"]))}
 
     storage.save_yaml_file(
         path,
@@ -333,7 +340,8 @@ def _place(entry_id: str, fill: Callable[[Path], None], *, replace: bool) -> tup
 
 
 def _commit(items: list, *, replace: bool, expected_revision: Optional[int],
-            recipes: tuple = (), progress: Optional[Callable[[str], None]] = None) -> dict:
+            recipes: tuple = (), seeded: tuple = (),
+            progress: Optional[Callable[[str], None]] = None) -> dict:
     """``items`` is ``[(id, fill, row)]``; a callable ``row`` is given
     ``(existing row or None, stamp)`` under the index lock. Any failure
     rolls the placed directories back, restoring replaced copies."""
@@ -356,6 +364,8 @@ def _commit(items: list, *, replace: bool, expected_revision: Optional[int],
                 by_id = {r["id"]: r for r in index["recipes"]}
                 by_id.update({r["id"]: r for r in recipes})
                 index["recipes"] = [by_id[k] for k in sorted(by_id)]
+            if seeded:
+                index["seeded"] = sorted(set(index["seeded"]) | set(seeded))
 
         index = _write_index(mutate, expected_revision=expected_revision)
     except BaseException:
@@ -637,6 +647,39 @@ def import_entries(source: str, *, only=None, name: Optional[str] = None,
     return {"source": provenance, "kind": kind, "imported": ids, "count": len(ids),
             "recipes": [r["id"] for r in merged], "revision": index["revision"],
             "warnings": warnings}
+
+
+# ── samples: the bundled blueprints, offered once ───────────────────────────
+
+def seed_samples() -> list:
+    """Add each bundled sample profile to the store once; returns the ids added.
+
+    Hermes runs no plugin code at install time, so ``register`` calls this on
+    every load. ``seeded`` records every sample id offered, so a sample the
+    user removed stays removed and an id the user already owns is left alone.
+    """
+    if not SAMPLES_ROOT.is_dir():
+        return []
+    index = load_index()
+    pending = sorted(d for d in SAMPLES_ROOT.iterdir()
+                     if d.name not in index["seeded"]
+                     and (d / "distribution.yaml").is_file())
+    if not pending:
+        return []
+    ext = _external_ids()
+    items = []
+    for d in pending:
+        _kind, (cand,), _recipes = _discover(d, str(d), only=None, name=d.name)
+        if (cand["id"] in index["entries"] or cand["id"] in ext
+                or (profiles_dir() / cand["id"]).exists()):
+            continue
+        _reject_symlinks(cand["src"])
+        items.append((cand["id"], _copy_fill(cand),
+                      _row(SAMPLES_PACK, cand["display_name"], cand["category"],
+                           "bundled")))
+    _commit(items, replace=False, expected_revision=index["revision"],
+            seeded=tuple(d.name for d in pending))
+    return [item[0] for item in items]
 
 
 # ── adopt: a live profile under the hermes root → a store entry ─────────────

@@ -702,3 +702,51 @@ def test_cli_adopt_unknown_exits_1(capsys):
 def test_cli_bare_profiles_lists(capsys):
     code, env, err = _run("profiles", capsys=capsys)
     assert code == 0 and env is None and "entr" in err
+
+
+# ── bundled samples ──────────────────────────────────────────────────────────
+
+_SAMPLE_IDS = sorted(d.name for d in catalog_store.SAMPLES_ROOT.iterdir()
+                     if (d / "distribution.yaml").is_file())
+
+
+def test_sample_dir_names_match_their_distribution_names():
+    assert len(_SAMPLE_IDS) == 5
+    for eid in _SAMPLE_IDS:
+        dist = yaml.safe_load(
+            (catalog_store.SAMPLES_ROOT / eid / "distribution.yaml").read_text())
+        assert dist["name"] == eid
+
+
+def test_seed_samples_fills_a_fresh_store_once():
+    assert catalog_store.seed_samples() == _SAMPLE_IDS
+    index = catalog_store.load_index(use_cache=False)
+    assert index["seeded"] == _SAMPLE_IDS
+    assert all(index["entries"][eid]["pack"] == catalog_store.SAMPLES_PACK
+               for eid in _SAMPLE_IDS)
+    assert all((catalog_store.profiles_dir() / eid / "SOUL.md").is_file()
+               for eid in _SAMPLE_IDS)
+
+    assert catalog_store.seed_samples() == []
+    assert catalog_store.load_index(use_cache=False)["revision"] == index["revision"]
+
+
+def test_seed_samples_never_brings_back_a_removed_sample():
+    catalog_store.seed_samples()
+    catalog_store.remove_entry("software_tester")
+
+    assert catalog_store.seed_samples() == []
+    assert "software_tester" not in catalog_store.load_index(use_cache=False)["entries"]
+
+
+def test_seed_samples_leaves_a_user_owned_id_alone():
+    catalog_store.author_entry("software_manager", soul="mine")
+
+    added = catalog_store.seed_samples()
+
+    assert "software_manager" not in added
+    index = catalog_store.load_index(use_cache=False)
+    assert index["entries"]["software_manager"]["pack"] == catalog_store.LOCAL_PACK
+    assert "software_manager" in index["seeded"]
+    assert (catalog_store.profiles_dir() / "software_manager" / "SOUL.md"
+            ).read_text().strip() == "mine"

@@ -12,7 +12,9 @@ so plugin discovery costs one ``import`` + argparse wiring.
 
 
 def register(ctx):
-    from . import cli, hooks, prompt, schemas, tools, worker_exit_guard
+    import logging
+
+    from . import catalog_store, cli, hooks, prompt, schemas, tools, worker_exit_guard
 
     for name, schema, handler, emoji, gate in tools.TOOL_TABLE:
         ctx.register_tool(name=name, toolset=hooks.TOOLSET, schema=schema,
@@ -68,6 +70,17 @@ def register(ctx):
     # reached the model exits non-zero instead of looking like a clean exit
     # (which the dispatcher books as a protocol violation). Settings key
     # `worker_exit_guard`; "off" disables it.
-    worker_exit_guard.install(cli._settings().get("worker_exit_guard", "wrapper"))
+    settings = cli._settings()
+    worker_exit_guard.install(settings.get("worker_exit_guard", "wrapper"))
+
+    # Hermes has no install hook, so the first load after an install or
+    # upgrade puts the bundled sample profiles in the catalog. Settings key
+    # `seed_samples`; a failure here must never stop the plugin loading.
+    if settings.get("seed_samples", True):
+        try:
+            catalog_store.seed_samples()
+        except Exception:
+            logging.getLogger("hermes_plugins.hermes_agent_synergia").warning(
+                "could not seed the sample profiles", exc_info=True)
 
     ctx.on_unload(hooks.teardown)                  # drop caches, close nothing else

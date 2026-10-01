@@ -33,5 +33,6 @@ config_schema:
   review_round_limit: {type: int, default: 3,    description: "Review rounds a card may take before it is parked for a human decision. 0 disables the loop guard."}
   parked_lanes:     {type: bool, default: true,  description: "Show review / triage / respawn-guarded cards in the approvals inbox alongside blocked ones."}
   auto_merge:       {type: bool, default: true,  description: "Fast-forward the workdir's branch to a thread's result branch when its last card finishes. false leaves it to `hermes team merge`."}
+  seed_samples:     {type: bool, default: true,  description: "Add each bundled sample profile (samples/profiles/) to the catalog store once, on the first load after install or upgrade. A removed sample stays removed."}
   worker_exit_guard: {type: str, default: "wrapper",
                                                  description: "wrapper | off — wrap dispatcher workers through $HERMES_BIN so a worker that never reached the model exits non-zero instead of being booked as a protocol violation."}

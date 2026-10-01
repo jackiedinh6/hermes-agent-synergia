@@ -118,7 +118,7 @@ class _Recorder:
         return False
 
 
-def _discover(recorder: _Recorder):
+def _discover(recorder: _Recorder, settings: dict | None = None):
     """Real discovery with the recording ctx: symlink the plugin dir into
     the temp HERMES_HOME, enable it, let PluginManager run the real
     ``register()``. Returns the LoadedPlugin — ``loaded.error is None`` is
@@ -147,8 +147,11 @@ def _discover(recorder: _Recorder):
     link = root / "plugins" / "hermes-agent-synergia"
     if not link.exists():
         os.symlink(str(PLUGIN_SRC), str(link))
-    (root / "config.yaml").write_text(yaml.safe_dump(
-        {"plugins": {"enabled": ["hermes-agent-synergia"]}}), encoding="utf-8")
+    plugins = {"enabled": ["hermes-agent-synergia"]}
+    if settings:
+        plugins["entries"] = {"hermes-agent-synergia": {"settings": settings}}
+    (root / "config.yaml").write_text(yaml.safe_dump({"plugins": plugins}),
+                                      encoding="utf-8")
 
     pmod._reset_plugin_managers_for_tests()
     original_ctx = pmod.PluginContext
@@ -219,6 +222,18 @@ def test_member_of_policy_off_team_registers_no_pre_tool_call(_teamhome):
     _discover(rec)
     assert "pre_tool_call" not in _hook_names(rec)
     assert "kanban_task_claimed" in _hook_names(rec)
+
+
+def test_register_seeds_the_sample_profiles(_teamhome):
+    _discover(_Recorder("lonely"))
+    index = yaml.safe_load((_teamhome / "catalog" / "catalog.yaml").read_text())
+    assert len(index["seeded"]) == 5
+    assert sorted(index["entries"]) == index["seeded"]
+
+
+def test_seed_samples_off_leaves_the_catalog_alone(_teamhome):
+    _discover(_Recorder("lonely"), settings={"seed_samples": False})
+    assert not (_teamhome / "catalog" / "catalog.yaml").exists()
 
 
 def test_policy_needed_direct_matrix(_teamhome):
